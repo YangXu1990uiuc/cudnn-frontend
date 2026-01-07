@@ -23,6 +23,8 @@
 #pragma once
 
 #include <algorithm>
+
+namespace cudnn_frontend { namespace graph { class ReductionNode; } }
 #include <array>
 #include <cstddef>
 #include <functional>
@@ -77,6 +79,7 @@ namespace cudnn_frontend {
 class Operation_v8 : public BackendDescriptor {
    public:
     friend class OperationBuilder_v8;
+    friend class cudnn_frontend::graph::ReductionNode;
     std::string
     describe() const override {
         std::stringstream ss;
