@@ -157,6 +157,18 @@ typedef struct [[nodiscard]] error_object {
     }                                                                                                             \
     CUDNN_FRONTEND_WHILE_FALSE
 
+// Macro to check cudnnStatus_t and return error_t if failed.
+// Used when directly calling cuDNN backend API instead of using builder pattern.
+#define CHECK_CUDNN_STATUS(expr, msg)                              \
+    do {                                                           \
+        auto status = (expr);                                      \
+        if (status != CUDNN_STATUS_SUCCESS) {                      \
+            RETURN_CUDNN_FRONTEND_ERROR_IF(                        \
+                true, error_code_t::CUDNN_BACKEND_API_FAILED, msg); \
+        }                                                          \
+    }                                                              \
+    CUDNN_FRONTEND_WHILE_FALSE
+
 NLOHMANN_JSON_SERIALIZE_ENUM(error_code_t,
                              {
                                  {error_code_t::OK, "OK"},

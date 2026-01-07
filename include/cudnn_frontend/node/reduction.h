@@ -62,17 +62,6 @@ class ReductionNode : public NodeCRTP<ReductionNode> {
         CUDNN_FRONTEND_UNUSED(raw_operations);
         CUDNN_FE_LOG_LABEL("INFO: " << "Building ReductionNode operations " << attributes.name << " ");
 
-        // Helper macro to check cudnnStatus_t and return error if failed
-#define CHECK_CUDNN_STATUS(expr, msg)                                      \
-    do {                                                                   \
-        auto status = (expr);                                              \
-        if (status != CUDNN_STATUS_SUCCESS) {                              \
-            RETURN_CUDNN_FRONTEND_ERROR_IF(true,                           \
-                                           error_code_t::CUDNN_BACKEND_API_FAILED, \
-                                           msg);                           \
-        }                                                                  \
-    } while (0)
-
         // Create reduction descriptor by directly calling cuDNN backend API
         ReductionDesc_v8 reduction_descriptor;
 
@@ -163,8 +152,6 @@ class ReductionNode : public NodeCRTP<ReductionNode> {
                           "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
 
         operations.push_back(std::make_shared<Operation_v8>(std::move(reduction_operation)));
-
-#undef CHECK_CUDNN_STATUS
 
         auto const& non_virtual_uids = attributes.get_non_virtual_uids();
         uids_involved_in_operations.insert(non_virtual_uids.begin(), non_virtual_uids.end());
