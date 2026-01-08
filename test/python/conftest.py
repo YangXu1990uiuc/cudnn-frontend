@@ -52,6 +52,8 @@ def pytest_addoption(parser):
     parser.addoption("--dryrun", action="store", nargs="?", const=1, type=int, default=0, help="show repro commands when 1, 2, or 3 (use with '-s')")
     parser.addoption("--diffs", action="store", type=int, default=10, help="set number of numerical mismatches to display")
     parser.addoption("--repro", action="store", type=str, default=None, help="specify config string to run repro function")
+    parser.addoption("--seed", action="store", type=int, default=None, help="[fuzzer] random seed for reproducibility")
+    parser.addoption("--num-tests", action="store", type=int, default=100, help="[fuzzer] number of random tests to run")
     parser.addoption("--perf", action="store_true", help="enable performance profiling")
 
     # MHA command line options to overwrite specific test dimensions in test_mhas.py and test_mhas_v2.py.
