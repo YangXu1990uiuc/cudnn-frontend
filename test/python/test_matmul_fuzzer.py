@@ -190,6 +190,26 @@ def compute_num_elements(shape: Tuple[int, ...], strides: Tuple[int, ...]) -> in
     return max_offset + 1
 
 
+def fill_with_garbage(tensor: torch.Tensor, nan_probability: float = 0.1) -> None:
+    """
+    Fill tensor with garbage values (mix of random values and NaNs).
+    This helps catch bugs where cuDNN doesn't write all output locations.
+    """
+    # Choose range based on dtype to avoid overflow
+    if tensor.dtype in (torch.float16, torch.bfloat16):
+        lo, hi = -1e4, 1e4  # FP16 max is ~65504
+    else:
+        lo, hi = -1e6, 1e6
+
+    # Fill with random garbage
+    tensor.uniform_(lo, hi)
+
+    # Sprinkle in some NaNs (only for float types)
+    if nan_probability > 0 and tensor.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        nan_mask = torch.rand(tensor.shape, device=tensor.device) < nan_probability
+        tensor[nan_mask] = float('nan')
+
+
 # ============================================================================
 # Test Configuration
 # ============================================================================
@@ -424,8 +444,9 @@ def create_tensors(config: MatmulConfig, rng: random.Random):
     A = torch.as_strided(a_storage, a_shape, a_strides)
     B = torch.as_strided(b_storage, b_shape, b_strides)
 
-    # Output tensor
-    c_storage = torch.zeros(c_elems, device='cuda', dtype=config.c_dtype)
+    # Output tensor - fill with garbage to catch bugs where cuDNN doesn't write all outputs
+    c_storage = torch.empty(c_elems, device='cuda', dtype=config.c_dtype)
+    fill_with_garbage(c_storage)
     C = torch.as_strided(c_storage, c_shape, c_strides)
 
     # Bias tensor if needed
@@ -459,20 +480,23 @@ def compute_reference(config: MatmulConfig, A: torch.Tensor, B: torch.Tensor, bi
     A_compute = A.to(compute_dtype)
     B_compute = B.to(compute_dtype)
 
-    # Matmul: C = A @ B
-    # A: (batch, M, K), B: (batch, K, N), C: (batch, M, N)
-    C_ref = torch.matmul(A_compute, B_compute)
+    try:
+        # Matmul: C = A @ B
+        # A: (batch, M, K), B: (batch, K, N), C: (batch, M, N)
+        C_ref = torch.matmul(A_compute, B_compute)
 
-    # Epilogue
-    if bias is not None and config.epilogue in [EpilogueType.BIAS, EpilogueType.BIAS_RELU, EpilogueType.BIAS_GELU]:
-        C_ref = C_ref + bias.to(compute_dtype)
+        # Epilogue
+        if bias is not None and config.epilogue in [EpilogueType.BIAS, EpilogueType.BIAS_RELU, EpilogueType.BIAS_GELU]:
+            C_ref = C_ref + bias.to(compute_dtype)
 
-    if config.epilogue in [EpilogueType.RELU, EpilogueType.BIAS_RELU]:
-        C_ref = torch.relu(C_ref)
-    elif config.epilogue in [EpilogueType.GELU, EpilogueType.BIAS_GELU]:
-        C_ref = torch.nn.functional.gelu(C_ref)
+        if config.epilogue in [EpilogueType.RELU, EpilogueType.BIAS_RELU]:
+            C_ref = torch.relu(C_ref)
+        elif config.epilogue in [EpilogueType.GELU, EpilogueType.BIAS_GELU]:
+            C_ref = torch.nn.functional.gelu(C_ref)
 
-    return C_ref.to(config.c_dtype)
+        return C_ref.to(config.c_dtype)
+    finally:
+        del A_compute, B_compute
 
 
 def run_cudnn_matmul(config: MatmulConfig, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
@@ -532,8 +556,14 @@ def run_cudnn_matmul(config: MatmulConfig, A: torch.Tensor, B: torch.Tensor, C: 
         graph.check_support()
         graph.build_plans(cudnn.build_plan_policy.HEURISTICS_CHOICE)
 
-        # Allocate workspace
-        workspace = torch.empty(graph.get_workspace_size(), device='cuda', dtype=torch.uint8)
+        # Allocate workspace and fill with garbage to catch uninitialized memory bugs
+        workspace_size = graph.get_workspace_size()
+        workspace = torch.empty(workspace_size, device='cuda', dtype=torch.uint8)
+        if workspace_size > 0:
+            # Fill with random garbage + some NaN patterns to test proper workspace init
+            workspace.random_(0, 256)
+            nan_mask = torch.rand(workspace_size, device='cuda') < 0.1
+            workspace[nan_mask] = 0xFF
 
         # Build variant pack
         variant_pack = {A_tensor: A, B_tensor: B, result: C}
@@ -626,7 +656,7 @@ def format_test_header(test_num: int, total_tests: int, config: MatmulConfig) ->
 
     lines += [
         f"epilogue         = {epilogue_name(config.epilogue)}",
-        f"repro_cmd        = pytest -vv -s -rA test_matmul_fuzzer.py::test_repro --repro \"{config.to_repro_dict()}\"",
+        f"repro_cmd        = pytest -vv -s -rA {__file__}::test_repro --repro \"{config.to_repro_dict()}\"",
         " ",
     ]
     return "\n".join(lines)
@@ -714,34 +744,44 @@ def test_matmul_fuzz(test_num: int, total_tests: int, config_seed: int, cudnn_ha
     # Create tensors
     rng = random.Random(config_seed)
     A, B, C, bias = create_tensors(config, rng)
+    C_expected = None
 
-    # Print test header
-    print(format_test_header(test_num, total_tests, config))
+    try:
+        # Print test header
+        print(format_test_header(test_num, total_tests, config))
 
-    # Compute reference
-    C_expected = compute_reference(config, A, B, bias)
+        # Compute reference
+        C_expected = compute_reference(config, A, B, bias)
 
-    # Run cuDNN
-    success, msg = run_cudnn_matmul(config, A, B, C, bias, cudnn_handle)
+        # Run cuDNN
+        success, msg = run_cudnn_matmul(config, A, B, C, bias, cudnn_handle)
 
-    if not success:
-        print(f"%%%% cuDNN execution failed: {msg}")
-        # Skip tests with unsupported configurations rather than failing
-        skip_keywords = ["not supported", "finalize failed", "mismatch", "invalid", "unsupported"]
-        if any(kw in msg.lower() for kw in skip_keywords):
-            print("@@@@ Overall result: SKIPPED (unsupported configuration)")
-            pytest.skip(f"Unsupported configuration: {msg}")
-        else:
-            print("@@@@ Overall result: FAILED")
-            pytest.fail(f"cuDNN execution failed: {msg}")
+        if not success:
+            print(f"%%%% cuDNN execution failed: {msg}")
+            # Skip tests with unsupported configurations rather than failing
+            skip_keywords = ["not supported", "finalize failed", "mismatch", "invalid", "unsupported"]
+            if any(kw in msg.lower() for kw in skip_keywords):
+                print("@@@@ Overall result: SKIPPED (unsupported configuration)")
+                pytest.skip(f"Unsupported configuration: {msg}")
+            else:
+                print("@@@@ Overall result: FAILED")
+                pytest.fail(f"cuDNN execution failed: {msg}")
 
-    # Compare results
-    passed, mismatch_count, compare_msg = compare_results(C, C_expected, config, max_diffs)
+        # Compare results
+        passed, mismatch_count, compare_msg = compare_results(C, C_expected, config, max_diffs)
 
-    print(format_test_result(passed, compare_msg))
+        print(format_test_result(passed, compare_msg))
 
-    if not passed:
-        pytest.fail(f"Numerical mismatch: {mismatch_count} elements differ")
+        if not passed:
+            pytest.fail(f"Numerical mismatch: {mismatch_count} elements differ")
+    finally:
+        # Explicit cleanup to prevent GPU memory accumulation
+        del A, B, C
+        if bias is not None:
+            del bias
+        if C_expected is not None:
+            del C_expected
+        torch.cuda.empty_cache()
 
 
 # Separate test list for unaligned stress testing
@@ -771,34 +811,44 @@ def test_matmul_fuzz_unaligned(test_num: int, total_tests: int, config_seed: int
     # Create tensors
     rng = random.Random(config_seed)
     A, B, C, bias = create_tensors(config, rng)
+    C_expected = None
 
-    # Print test header
-    print(format_test_header(test_num, total_tests, config))
+    try:
+        # Print test header
+        print(format_test_header(test_num, total_tests, config))
 
-    # Compute reference
-    C_expected = compute_reference(config, A, B, bias)
+        # Compute reference
+        C_expected = compute_reference(config, A, B, bias)
 
-    # Run cuDNN
-    success, msg = run_cudnn_matmul(config, A, B, C, bias, cudnn_handle)
+        # Run cuDNN
+        success, msg = run_cudnn_matmul(config, A, B, C, bias, cudnn_handle)
 
-    if not success:
-        print(f"%%%% cuDNN execution failed: {msg}")
-        # Skip tests with unsupported configurations rather than failing
-        skip_keywords = ["not supported", "finalize failed", "mismatch", "invalid", "unsupported"]
-        if any(kw in msg.lower() for kw in skip_keywords):
-            print("@@@@ Overall result: SKIPPED (unsupported configuration)")
-            pytest.skip(f"Unsupported configuration: {msg}")
-        else:
-            print("@@@@ Overall result: FAILED")
-            pytest.fail(f"cuDNN execution failed: {msg}")
+        if not success:
+            print(f"%%%% cuDNN execution failed: {msg}")
+            # Skip tests with unsupported configurations rather than failing
+            skip_keywords = ["not supported", "finalize failed", "mismatch", "invalid", "unsupported"]
+            if any(kw in msg.lower() for kw in skip_keywords):
+                print("@@@@ Overall result: SKIPPED (unsupported configuration)")
+                pytest.skip(f"Unsupported configuration: {msg}")
+            else:
+                print("@@@@ Overall result: FAILED")
+                pytest.fail(f"cuDNN execution failed: {msg}")
 
-    # Compare results
-    passed, mismatch_count, compare_msg = compare_results(C, C_expected, config, max_diffs)
+        # Compare results
+        passed, mismatch_count, compare_msg = compare_results(C, C_expected, config, max_diffs)
 
-    print(format_test_result(passed, compare_msg))
+        print(format_test_result(passed, compare_msg))
 
-    if not passed:
-        pytest.fail(f"Numerical mismatch: {mismatch_count} elements differ")
+        if not passed:
+            pytest.fail(f"Numerical mismatch: {mismatch_count} elements differ")
+    finally:
+        # Explicit cleanup to prevent GPU memory accumulation
+        del A, B, C
+        if bias is not None:
+            del bias
+        if C_expected is not None:
+            del C_expected
+        torch.cuda.empty_cache()
 
 
 @pytest.mark.L0
@@ -830,20 +880,30 @@ def test_repro(cudnn_handle, request):
     # Run test
     rng = random.Random(config.rng_seed)
     A, B, C, bias = create_tensors(config, rng)
+    C_expected = None
 
-    print(format_test_header(1, 1, config))
+    try:
+        print(format_test_header(1, 1, config))
 
-    C_expected = compute_reference(config, A, B, bias)
-    success, msg = run_cudnn_matmul(config, A, B, C, bias, cudnn_handle)
+        C_expected = compute_reference(config, A, B, bias)
+        success, msg = run_cudnn_matmul(config, A, B, C, bias, cudnn_handle)
 
-    if not success:
-        pytest.fail(f"cuDNN execution failed: {msg}")
+        if not success:
+            pytest.fail(f"cuDNN execution failed: {msg}")
 
-    passed, mismatch_count, compare_msg = compare_results(C, C_expected, config, max_diffs=20)
-    print(format_test_result(passed, compare_msg))
+        passed, mismatch_count, compare_msg = compare_results(C, C_expected, config, max_diffs=20)
+        print(format_test_result(passed, compare_msg))
 
-    if not passed:
-        pytest.fail(f"Numerical mismatch: {mismatch_count} elements differ")
+        if not passed:
+            pytest.fail(f"Numerical mismatch: {mismatch_count} elements differ")
+    finally:
+        # Explicit cleanup to prevent GPU memory accumulation
+        del A, B, C
+        if bias is not None:
+            del bias
+        if C_expected is not None:
+            del C_expected
+        torch.cuda.empty_cache()
 
 
 # ============================================================================
@@ -868,17 +928,26 @@ def test_matmul_basic_fp16(cudnn_handle):
 
     rng = random.Random(config.rng_seed)
     A, B, C, bias = create_tensors(config, rng)
+    C_expected = None
 
-    print(format_test_header(1, 1, config))
+    try:
+        print(format_test_header(1, 1, config))
 
-    C_expected = compute_reference(config, A, B, bias)
-    success, msg = run_cudnn_matmul(config, A, B, C, bias, cudnn_handle)
+        C_expected = compute_reference(config, A, B, bias)
+        success, msg = run_cudnn_matmul(config, A, B, C, bias, cudnn_handle)
 
-    assert success, f"cuDNN failed: {msg}"
+        assert success, f"cuDNN failed: {msg}"
 
-    passed, _, compare_msg = compare_results(C, C_expected, config)
-    print(format_test_result(passed, compare_msg))
-    assert passed
+        passed, _, compare_msg = compare_results(C, C_expected, config)
+        print(format_test_result(passed, compare_msg))
+        assert passed
+    finally:
+        del A, B, C
+        if bias is not None:
+            del bias
+        if C_expected is not None:
+            del C_expected
+        torch.cuda.empty_cache()
 
 
 @pytest.mark.L0
@@ -899,17 +968,26 @@ def test_matmul_basic_bf16(cudnn_handle):
 
     rng = random.Random(config.rng_seed)
     A, B, C, bias = create_tensors(config, rng)
+    C_expected = None
 
-    print(format_test_header(1, 1, config))
+    try:
+        print(format_test_header(1, 1, config))
 
-    C_expected = compute_reference(config, A, B, bias)
-    success, msg = run_cudnn_matmul(config, A, B, C, bias, cudnn_handle)
+        C_expected = compute_reference(config, A, B, bias)
+        success, msg = run_cudnn_matmul(config, A, B, C, bias, cudnn_handle)
 
-    assert success, f"cuDNN failed: {msg}"
+        assert success, f"cuDNN failed: {msg}"
 
-    passed, _, compare_msg = compare_results(C, C_expected, config)
-    print(format_test_result(passed, compare_msg))
-    assert passed
+        passed, _, compare_msg = compare_results(C, C_expected, config)
+        print(format_test_result(passed, compare_msg))
+        assert passed
+    finally:
+        del A, B, C
+        if bias is not None:
+            del bias
+        if C_expected is not None:
+            del C_expected
+        torch.cuda.empty_cache()
 
 
 @pytest.mark.L0
@@ -930,14 +1008,23 @@ def test_matmul_with_bias(cudnn_handle):
 
     rng = random.Random(config.rng_seed)
     A, B, C, bias = create_tensors(config, rng)
+    C_expected = None
 
-    print(format_test_header(1, 1, config))
+    try:
+        print(format_test_header(1, 1, config))
 
-    C_expected = compute_reference(config, A, B, bias)
-    success, msg = run_cudnn_matmul(config, A, B, C, bias, cudnn_handle)
+        C_expected = compute_reference(config, A, B, bias)
+        success, msg = run_cudnn_matmul(config, A, B, C, bias, cudnn_handle)
 
-    assert success, f"cuDNN failed: {msg}"
+        assert success, f"cuDNN failed: {msg}"
 
-    passed, _, compare_msg = compare_results(C, C_expected, config)
-    print(format_test_result(passed, compare_msg))
-    assert passed
+        passed, _, compare_msg = compare_results(C, C_expected, config)
+        print(format_test_result(passed, compare_msg))
+        assert passed
+    finally:
+        del A, B, C
+        if bias is not None:
+            del bias
+        if C_expected is not None:
+            del C_expected
+        torch.cuda.empty_cache()
