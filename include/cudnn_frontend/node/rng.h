@@ -1,8 +1,5 @@
 #pragma once
 
-#include "../../cudnn_frontend_Rng.h"
-#include "../../cudnn_frontend_Logging.h"
-
 #include "../graph_helpers.h"
 #include "../node_interface.h"
 
@@ -61,53 +58,104 @@ class RngNode : public NodeCRTP<RngNode> {
         managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
         CUDNN_FRONTEND_UNUSED(raw_operations);
-        CUDNN_FE_LOG_LABEL("INFO: Building RngNode operations " << attributes.name << " ");
+        CUDNN_FE_LOG_LABEL("INFO: " << "Building RngNode operations " << attributes.name << " ");
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.get_distribution() != RngDistribution_t::BERNOULLI,
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "no other distribution except bernoulli supported.");
 
-        auto rng_descriptor = cudnn_frontend::RngDescBuilder()
-                                  .setRngDistribution(attributes.get_distribution())
-                                  .setBernoulliDistProbability(attributes.get_bernoulli_probability().value())
-                                  .build();
+        // Create RNG descriptor by directly calling cuDNN backend API
+        RngDesc_v8 rng_descriptor;
 
-        auto&& Rng_operation_builder = cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_RNG_DESCRIPTOR);
+        CHECK_CUDNN_STATUS(rng_descriptor.initialize_managed_backend_pointer(CUDNN_BACKEND_RNG_DESCRIPTOR),
+                          "CUDNN_BACKEND_RNG_DESCRIPTOR: cudnnCreate Failed");
 
+        // Set distribution type
+        cudnnRngDistribution_t cudnn_rng_distribution;
+        CHECK_CUDNN_STATUS(detail::convert_to_cudnn_type(attributes.get_distribution(), cudnn_rng_distribution),
+                          "CUDNN_BACKEND_RNG_DESCRIPTOR: convert distribution type failed");
+        CHECK_CUDNN_STATUS(detail::set_attribute(rng_descriptor.get_raw_desc(),
+                                                 CUDNN_ATTR_RNG_DISTRIBUTION,
+                                                 CUDNN_TYPE_RNG_DISTRIBUTION,
+                                                 1,
+                                                 &cudnn_rng_distribution),
+                          "CUDNN_BACKEND_RNG_DESCRIPTOR: SetAttribute CUDNN_ATTR_RNG_DISTRIBUTION Failed");
+
+        // Set Bernoulli distribution probability
+        double bernoulli_prob = attributes.get_bernoulli_probability().value();
+        CHECK_CUDNN_STATUS(detail::set_attribute(rng_descriptor.get_raw_desc(),
+                                                 CUDNN_ATTR_RNG_BERNOULLI_DIST_PROBABILITY,
+                                                 CUDNN_TYPE_DOUBLE,
+                                                 1,
+                                                 &bernoulli_prob),
+                          "CUDNN_BACKEND_RNG_DESCRIPTOR: SetAttribute CUDNN_ATTR_RNG_BERNOULLI_DIST_PROBABILITY Failed");
+
+        // Finalize the descriptor
+        CHECK_CUDNN_STATUS(detail::finalize(rng_descriptor.get_raw_desc()),
+                          "CUDNN_BACKEND_RNG_DESCRIPTOR: cudnnFinalize Failed");
+        CUDNN_FE_LOG_LABEL_ENDL(rng_descriptor);
+
+        // Create operation by directly calling cuDNN backend API
+        Operation_v8 rng_operation;
+
+        CHECK_CUDNN_STATUS(rng_operation.initialize_managed_backend_pointer(CUDNN_BACKEND_OPERATION_RNG_DESCRIPTOR),
+                          "CUDNN_BACKEND_OPERATION: cudnnCreate Failed");
+
+        // Set output tensor Y
         CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(Y, Rng_attributes::output_names::Y);
-        Rng_operation_builder.setyDesc(*(tensors.at(Y->second->get_uid())));
+        auto y_desc = tensors.at(Y->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(detail::set_attribute(rng_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_RNG_YDESC,
+                                                 CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                 1,
+                                                 &y_desc),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RNG_YDESC Failed");
 
-        Rng_operation_builder.setRngDesc(rng_descriptor);
+        // Set RNG descriptor
+        auto rng_raw_desc = rng_descriptor.get_raw_desc();
+        CHECK_CUDNN_STATUS(detail::set_attribute(rng_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_RNG_DESC,
+                                                 CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                 1,
+                                                 &rng_raw_desc),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RNG_DESC Failed");
 
         if (attributes.seed.has_value()) {
-            Rng_operation_builder.setSeed(attributes.get_seed().value());
+            // Set seed as int64_t value
+            int64_t seed_value = attributes.get_seed().value();
+            CHECK_CUDNN_STATUS(detail::set_attribute(rng_operation.get_raw_desc(),
+                                                     CUDNN_ATTR_OPERATION_RNG_SEED,
+                                                     CUDNN_TYPE_INT64,
+                                                     1,
+                                                     &seed_value),
+                              "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RNG_SEED Failed");
         } else {
+            // Set seed tensor descriptor
             CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(Seed, Rng_attributes::input_names::Seed);
-            Rng_operation_builder.setSeedDesc(*(tensors.at(Seed->second->get_uid())));
+            auto seed_desc = tensors.at(Seed->second->get_uid())->get_raw_desc();
+            CHECK_CUDNN_STATUS(detail::set_attribute(rng_operation.get_raw_desc(),
+                                                     CUDNN_ATTR_OPERATION_RNG_SEED,
+                                                     CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                     1,
+                                                     &seed_desc),
+                              "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RNG_SEED Failed");
 
+            // Set offset tensor descriptor
             CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(Offset, Rng_attributes::input_names::Offset);
-            Rng_operation_builder.setOffsetDesc(*(tensors.at(Offset->second->get_uid())));
+            auto offset_desc = tensors.at(Offset->second->get_uid())->get_raw_desc();
+            CHECK_CUDNN_STATUS(detail::set_attribute(rng_operation.get_raw_desc(),
+                                                     CUDNN_ATTR_OPERATION_RNG_OFFSET_DESC,
+                                                     CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                     1,
+                                                     &offset_desc),
+                              "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RNG_OFFSET_DESC Failed");
         }
 
-#ifdef NV_CUDNN_DISABLE_EXCEPTION
-        // disable exception macro is defined. Calling build will not throw.
-        // Check status of desc and return error.
-        auto operation = Rng_operation_builder.build();
-        RETURN_CUDNN_FRONTEND_ERROR_IF(operation.get_status() != CUDNN_STATUS_SUCCESS,
-                                       error_code_t::CUDNN_BACKEND_API_FAILED,
-                                       operation.get_error());
-        operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-#else
-        // build() can throw
-        // wrap in try catch
-        try {
-            auto operation = Rng_operation_builder.build();
-            operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-        } catch (cudnn_frontend::cudnnException& e) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                e.getCudnnStatus() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, e.what());
-        }
-#endif
+        CHECK_CUDNN_STATUS(detail::finalize(rng_operation.get_raw_desc()),
+                          "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
+
+        operations.push_back(std::make_shared<Operation_v8>(std::move(rng_operation)));
+
         auto const& non_virtual_uids = attributes.get_non_virtual_uids();
         uids_involved_in_operations.insert(non_virtual_uids.begin(), non_virtual_uids.end());
         return {error_code_t::OK, ""};

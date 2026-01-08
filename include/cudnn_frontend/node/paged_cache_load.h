@@ -1,8 +1,5 @@
 #pragma once
 
-#include "../../cudnn_frontend_Heuristics.h"
-#include "../../cudnn_frontend_Logging.h"
-
 #include "../graph_helpers.h"
 #include "../node_interface.h"
 
@@ -30,41 +27,63 @@ class PagedCacheLoadNode : public NodeCRTP<PagedCacheLoadNode> {
         managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
         CUDNN_FRONTEND_UNUSED(raw_operations);
+        CUDNN_FE_LOG_LABEL("INFO: " << "Building PagedCacheLoadNode operations " << attributes.name << " ");
 
-        auto&& paged_cache_load_operation_builder =
-            cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_PAGED_CACHE_LOAD_DESCRIPTOR);
+        // Create operation by directly calling cuDNN backend API
+        Operation_v8 paged_cache_load_operation;
 
+        CHECK_CUDNN_STATUS(paged_cache_load_operation.initialize_managed_backend_pointer(
+                               CUDNN_BACKEND_OPERATION_PAGED_CACHE_LOAD_DESCRIPTOR),
+                          "CUDNN_BACKEND_OPERATION: cudnnCreate Failed");
+
+        // Set container tensor
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(container, PagedCacheLoad_attributes::input_names::container);
-        paged_cache_load_operation_builder.setcontainerDesc(*(tensors.at(container->second->get_uid())));
+        auto container_desc = tensors.at(container->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(detail::set_attribute(paged_cache_load_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_PAGED_CACHE_LOAD_CONTAINER_DESC,
+                                                 CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                 1,
+                                                 &container_desc),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_PAGED_CACHE_LOAD_CONTAINER_DESC "
+                          "Failed");
 
+        // Set page table tensor
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(pageTable, PagedCacheLoad_attributes::input_names::pageTable);
-        paged_cache_load_operation_builder.setpageTableDesc(*(tensors.at(pageTable->second->get_uid())));
+        auto page_table_desc = tensors.at(pageTable->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(detail::set_attribute(paged_cache_load_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_PAGED_CACHE_LOAD_PAGE_TABLE_DESC,
+                                                 CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                 1,
+                                                 &page_table_desc),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_PAGED_CACHE_LOAD_PAGE_TABLE_DESC "
+                          "Failed");
 
+        // Set sequence length tensor
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(seqLen, PagedCacheLoad_attributes::input_names::seqLen);
-        paged_cache_load_operation_builder.setsequenceDesc(*(tensors.at(seqLen->second->get_uid())));
+        auto seq_len_desc = tensors.at(seqLen->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(detail::set_attribute(paged_cache_load_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_PAGED_CACHE_LOAD_SEQUENCE_DESC,
+                                                 CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                 1,
+                                                 &seq_len_desc),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_PAGED_CACHE_LOAD_SEQUENCE_DESC "
+                          "Failed");
 
+        // Set output tensor Y
         CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(yOut, PagedCacheLoad_attributes::output_names::yOut);
-        paged_cache_load_operation_builder.setyDesc(*(tensors.at(yOut->second->get_uid())));
+        auto y_desc = tensors.at(yOut->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(
+            detail::set_attribute(paged_cache_load_operation.get_raw_desc(),
+                                  CUDNN_ATTR_OPERATION_PAGED_CACHE_LOAD_YDESC,
+                                  CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                  1,
+                                  &y_desc),
+            "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_PAGED_CACHE_LOAD_YDESC Failed");
 
-#ifdef NV_CUDNN_DISABLE_EXCEPTION
-        // disable exception macro is defined. Calling build will not throw.
-        // Check status of desc and return error.
-        auto operation = paged_cache_load_operation_builder.build();
-        RETURN_CUDNN_FRONTEND_ERROR_IF(operation.get_status() != CUDNN_STATUS_SUCCESS,
-                                       error_code_t::CUDNN_BACKEND_API_FAILED,
-                                       operation.get_error());
-        operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-#else
-        // build() can throw
-        // wrap in try catch
-        try {
-            auto operation = paged_cache_load_operation_builder.build();
-            operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-        } catch (cudnn_frontend::cudnnException& e) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                e.getCudnnStatus() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, e.what());
-        }
-#endif
+        CHECK_CUDNN_STATUS(detail::finalize(paged_cache_load_operation.get_raw_desc()),
+                          "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
+
+        operations.push_back(std::make_shared<Operation_v8>(std::move(paged_cache_load_operation)));
 
         auto const& non_virtual_uids = attributes.get_non_virtual_uids();
         uids_involved_in_operations.insert(non_virtual_uids.begin(), non_virtual_uids.end());

@@ -25,6 +25,27 @@
 #include <algorithm>
 
 namespace cudnn_frontend { namespace graph { class ReductionNode; } }
+namespace cudnn_frontend { namespace graph { class PointwiseNode; } }
+namespace cudnn_frontend { namespace graph { class MatmulNode; } }
+namespace cudnn_frontend { namespace graph { class ConvolutionNode; } }
+namespace cudnn_frontend { namespace graph { class DgradNode; } }
+namespace cudnn_frontend { namespace graph { class WgradNode; } }
+namespace cudnn_frontend { namespace graph { class LayerNormNode; } }
+namespace cudnn_frontend { namespace graph { class BatchNormNode; } }
+namespace cudnn_frontend { namespace graph { class BatchnormInferenceNode; } }
+namespace cudnn_frontend { namespace graph { class RMSNormNode; } }
+namespace cudnn_frontend { namespace graph { class DRMSNormNode; } }
+namespace cudnn_frontend { namespace graph { class InstanceNormNode; } }
+namespace cudnn_frontend { namespace graph { class DINNode; } }
+namespace cudnn_frontend { namespace graph { class DLNNode; } }
+namespace cudnn_frontend { namespace graph { class DBNNode; } }
+namespace cudnn_frontend { namespace graph { class DBNWeightNode; } }
+namespace cudnn_frontend { namespace graph { class BatchNormFinalizeNode; } }
+namespace cudnn_frontend { namespace graph { class GenstatsNode; } }
+namespace cudnn_frontend { namespace graph { class ReshapeNode; } }
+namespace cudnn_frontend { namespace graph { class ResampleNode; } }
+namespace cudnn_frontend { namespace graph { class RngNode; } }
+namespace cudnn_frontend { namespace graph { class PagedCacheLoadNode; } }
 #include <array>
 #include <cstddef>
 #include <functional>
@@ -80,6 +101,27 @@ class Operation_v8 : public BackendDescriptor {
    public:
     friend class OperationBuilder_v8;
     friend class cudnn_frontend::graph::ReductionNode;
+    friend class cudnn_frontend::graph::PointwiseNode;
+    friend class cudnn_frontend::graph::MatmulNode;
+    friend class cudnn_frontend::graph::ConvolutionNode;
+    friend class cudnn_frontend::graph::DgradNode;
+    friend class cudnn_frontend::graph::WgradNode;
+    friend class cudnn_frontend::graph::LayerNormNode;
+    friend class cudnn_frontend::graph::BatchNormNode;
+    friend class cudnn_frontend::graph::BatchnormInferenceNode;
+    friend class cudnn_frontend::graph::RMSNormNode;
+    friend class cudnn_frontend::graph::DRMSNormNode;
+    friend class cudnn_frontend::graph::InstanceNormNode;
+    friend class cudnn_frontend::graph::DINNode;
+    friend class cudnn_frontend::graph::DLNNode;
+    friend class cudnn_frontend::graph::DBNNode;
+    friend class cudnn_frontend::graph::DBNWeightNode;
+    friend class cudnn_frontend::graph::BatchNormFinalizeNode;
+    friend class cudnn_frontend::graph::GenstatsNode;
+    friend class cudnn_frontend::graph::ReshapeNode;
+    friend class cudnn_frontend::graph::ResampleNode;
+    friend class cudnn_frontend::graph::RngNode;
+    friend class cudnn_frontend::graph::PagedCacheLoadNode;
     std::string
     describe() const override {
         std::stringstream ss;

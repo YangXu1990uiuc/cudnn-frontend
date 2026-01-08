@@ -1,7 +1,5 @@
 #pragma once
 
-#include "../../cudnn_frontend_Logging.h"
-
 #include "../graph_helpers.h"
 #include "../node_interface.h"
 
@@ -62,35 +60,38 @@ class ReshapeNode : public NodeCRTP<ReshapeNode> {
         CUDNN_FRONTEND_UNUSED(raw_operations);
         CUDNN_FE_LOG_LABEL("INFO: " << "Building ReshapeNode operations " << attributes.name << " ");
 
-        auto&& reshape_op_builder = cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_RESHAPE_DESCRIPTOR);
+        // Create operation by directly calling cuDNN backend API
+        Operation_v8 reshape_operation;
 
+        CHECK_CUDNN_STATUS(
+            reshape_operation.initialize_managed_backend_pointer(CUDNN_BACKEND_OPERATION_RESHAPE_DESCRIPTOR),
+            "CUDNN_BACKEND_OPERATION: cudnnCreate Failed");
+
+        // Set input tensor X
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(X, Reshape_attributes::input_names::X);
-        reshape_op_builder.setxDesc(*(tensors.at(X->second->get_uid())));
+        auto x_desc = tensors.at(X->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(detail::set_attribute(reshape_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_RESHAPE_XDESC,
+                                                 CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                 1,
+                                                 &x_desc),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RESHAPE_XDESC Failed");
 
+        // Set output tensor Y
         CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(Y, Reshape_attributes::output_names::Y);
-        reshape_op_builder.setyDesc(*(tensors.at(Y->second->get_uid())));
+        auto y_desc = tensors.at(Y->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(detail::set_attribute(reshape_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_RESHAPE_YDESC,
+                                                 CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                 1,
+                                                 &y_desc),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RESHAPE_YDESC Failed");
 
-        reshape_op_builder.setyDesc(*(tensors.at(Y->second->get_uid())));
+        CHECK_CUDNN_STATUS(detail::finalize(reshape_operation.get_raw_desc()),
+                          "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
 
-#ifdef NV_CUDNN_DISABLE_EXCEPTION
-        // disable exception macro is defined. Calling build will not throw.
-        // Check status of desc and return error.
-        auto operation = reshape_op_builder.build();
-        RETURN_CUDNN_FRONTEND_ERROR_IF(operation.get_status() != CUDNN_STATUS_SUCCESS,
-                                       error_code_t::CUDNN_BACKEND_API_FAILED,
-                                       operation.get_error());
-        operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-#else
-        // build() can throw
-        // wrap in try catch
-        try {
-            auto operation = reshape_op_builder.build();
-            operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-        } catch (cudnn_frontend::cudnnException& e) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                e.getCudnnStatus() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, e.what());
-        }
-#endif
+        operations.push_back(std::make_shared<Operation_v8>(std::move(reshape_operation)));
+
         auto const& non_virtual_uids = attributes.get_non_virtual_uids();
         uids_involved_in_operations.insert(non_virtual_uids.begin(), non_virtual_uids.end());
         return {error_code_t::OK, ""};

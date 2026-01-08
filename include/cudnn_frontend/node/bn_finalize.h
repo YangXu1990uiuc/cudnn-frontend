@@ -1,8 +1,5 @@
 #pragma once
 
-#include "../../cudnn_frontend_Heuristics.h"
-#include "../../cudnn_frontend_Logging.h"
-
 #include "../graph_helpers.h"
 #include "../node_interface.h"
 
@@ -63,77 +60,201 @@ class BatchNormFinalizeNode : public NodeCRTP<BatchNormFinalizeNode> {
         managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
         CUDNN_FRONTEND_UNUSED(raw_operations);
-        CUDNN_FE_LOG_LABEL("INFO:Building BatchNormFinalizeNode operations " << attributes.name << " ");
+        CUDNN_FE_LOG_LABEL("INFO: " << "Building BatchNormFinalizeNode operations " << attributes.name << " ");
 
-        // Create the batchnorm operation.
-        auto&& batchnorm_operation_builder =
-            cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_BN_FINALIZE_STATISTICS_DESCRIPTOR);
-        batchnorm_operation_builder.setComputeType(CUDNN_DATA_FLOAT)
-            .setBNFinalizeMode(CUDNN_BN_FINALIZE_STATISTICS_TRAINING);
+        // Create operation by directly calling cuDNN backend API
+        Operation_v8 bn_finalize_operation;
 
+        CHECK_CUDNN_STATUS(bn_finalize_operation.initialize_managed_backend_pointer(
+                               CUDNN_BACKEND_OPERATION_BN_FINALIZE_STATISTICS_DESCRIPTOR),
+                          "CUDNN_BACKEND_OPERATION: cudnnCreate Failed");
+
+        // Set BN finalize mode
+        cudnnBnFinalizeStatsMode_t bn_finalize_mode = CUDNN_BN_FINALIZE_STATISTICS_TRAINING;
+        CHECK_CUDNN_STATUS(detail::set_attribute(bn_finalize_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_BN_FINALIZE_STATS_MODE,
+                                                 CUDNN_TYPE_BN_FINALIZE_STATS_MODE,
+                                                 1,
+                                                 &bn_finalize_mode),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_STATS_MODE Failed");
+
+        // Set compute type (math precision)
+        cudnnDataType_t compute_type = CUDNN_DATA_FLOAT;
+        CHECK_CUDNN_STATUS(detail::set_attribute(bn_finalize_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_BN_FINALIZE_MATH_PREC,
+                                                 CUDNN_TYPE_DATA_TYPE,
+                                                 1,
+                                                 &compute_type),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_MATH_PREC Failed");
+
+        // Set SUM input tensor
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(SUM, BN_finalize_attributes::input_names::SUM);
-        batchnorm_operation_builder.setSumDesc(*(tensors.at(SUM->second->get_uid())));
+        auto sum_desc = tensors.at(SUM->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(detail::set_attribute(bn_finalize_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_BN_FINALIZE_Y_SUM_DESC,
+                                                 CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                 1,
+                                                 &sum_desc),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_Y_SUM_DESC Failed");
 
+        // Set SQ_SUM input tensor
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(SQ_SUM, BN_finalize_attributes::input_names::SQ_SUM);
-        batchnorm_operation_builder.setSqSumDesc(*(tensors.at(SQ_SUM->second->get_uid())));
+        auto sq_sum_desc = tensors.at(SQ_SUM->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(
+            detail::set_attribute(bn_finalize_operation.get_raw_desc(),
+                                  CUDNN_ATTR_OPERATION_BN_FINALIZE_Y_SQ_SUM_DESC,
+                                  CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                  1,
+                                  &sq_sum_desc),
+            "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_Y_SQ_SUM_DESC Failed");
 
-        CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(EQ_SCALE, BN_finalize_attributes::output_names::EQ_SCALE);
-        CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(EQ_BIAS, BN_finalize_attributes::output_names::EQ_BIAS);
-        batchnorm_operation_builder.setEqScaleAndBias(*(tensors.at(EQ_SCALE->second->get_uid())),
-                                                      *(tensors.at(EQ_BIAS->second->get_uid())));
-
-        CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(MEAN, BN_finalize_attributes::output_names::MEAN);
-        CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(INV_VARIANCE, BN_finalize_attributes::output_names::INV_VARIANCE);
-        batchnorm_operation_builder.setSavedMeanAndInvVar(*(tensors.at(MEAN->second->get_uid())),
-                                                          *(tensors.at(INV_VARIANCE->second->get_uid())));
-
+        // Set SCALE input tensor
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(SCALE, BN_finalize_attributes::input_names::SCALE);
-        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(BIAS, BN_finalize_attributes::input_names::BIAS);
-        batchnorm_operation_builder.setScaleAndBias(*(tensors.at(SCALE->second->get_uid())),
-                                                    *(tensors.at(BIAS->second->get_uid())));
+        auto scale_desc = tensors.at(SCALE->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(detail::set_attribute(bn_finalize_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_BN_FINALIZE_SCALE_DESC,
+                                                 CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                 1,
+                                                 &scale_desc),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_SCALE_DESC Failed");
 
+        // Set BIAS input tensor
+        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(BIAS, BN_finalize_attributes::input_names::BIAS);
+        auto bias_desc = tensors.at(BIAS->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(detail::set_attribute(bn_finalize_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_BN_FINALIZE_BIAS_DESC,
+                                                 CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                 1,
+                                                 &bias_desc),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_BIAS_DESC Failed");
+
+        // Set EQ_SCALE output tensor
+        CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(EQ_SCALE, BN_finalize_attributes::output_names::EQ_SCALE);
+        auto eq_scale_desc = tensors.at(EQ_SCALE->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(
+            detail::set_attribute(bn_finalize_operation.get_raw_desc(),
+                                  CUDNN_ATTR_OPERATION_BN_FINALIZE_EQ_SCALE_DESC,
+                                  CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                  1,
+                                  &eq_scale_desc),
+            "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_EQ_SCALE_DESC Failed");
+
+        // Set EQ_BIAS output tensor
+        CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(EQ_BIAS, BN_finalize_attributes::output_names::EQ_BIAS);
+        auto eq_bias_desc = tensors.at(EQ_BIAS->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(detail::set_attribute(bn_finalize_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_BN_FINALIZE_EQ_BIAS_DESC,
+                                                 CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                 1,
+                                                 &eq_bias_desc),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_EQ_BIAS_DESC Failed");
+
+        // Set PREV_RUNNING_MEAN input tensor
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(PREV_RUNNING_MEAN,
                                                   BN_finalize_attributes::input_names::PREV_RUNNING_MEAN);
+        auto prev_running_mean_desc = tensors.at(PREV_RUNNING_MEAN->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(
+            detail::set_attribute(bn_finalize_operation.get_raw_desc(),
+                                  CUDNN_ATTR_OPERATION_BN_FINALIZE_PREV_RUNNING_MEAN_DESC,
+                                  CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                  1,
+                                  &prev_running_mean_desc),
+            "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_PREV_RUNNING_MEAN_DESC Failed");
+
+        // Set PREV_RUNNING_VAR input tensor
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(PREV_RUNNING_VAR,
                                                   BN_finalize_attributes::input_names::PREV_RUNNING_VAR);
-        batchnorm_operation_builder.setPrevRunningMeanAndVar(*(tensors.at(PREV_RUNNING_MEAN->second->get_uid())),
-                                                             *(tensors.at(PREV_RUNNING_VAR->second->get_uid())));
+        auto prev_running_var_desc = tensors.at(PREV_RUNNING_VAR->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(
+            detail::set_attribute(bn_finalize_operation.get_raw_desc(),
+                                  CUDNN_ATTR_OPERATION_BN_FINALIZE_PREV_RUNNING_VAR_DESC,
+                                  CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                  1,
+                                  &prev_running_var_desc),
+            "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_PREV_RUNNING_VAR_DESC Failed");
 
+        // Set NEXT_RUNNING_MEAN output tensor
         CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(NEXT_RUNNING_MEAN,
                                                    BN_finalize_attributes::output_names::NEXT_RUNNING_MEAN);
+        auto next_running_mean_desc = tensors.at(NEXT_RUNNING_MEAN->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(
+            detail::set_attribute(bn_finalize_operation.get_raw_desc(),
+                                  CUDNN_ATTR_OPERATION_BN_FINALIZE_UPDATED_RUNNING_MEAN_DESC,
+                                  CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                  1,
+                                  &next_running_mean_desc),
+            "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_UPDATED_RUNNING_MEAN_DESC Failed");
+
+        // Set NEXT_RUNNING_VAR output tensor
         CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(NEXT_RUNNING_VAR,
                                                    BN_finalize_attributes::output_names::NEXT_RUNNING_VAR);
-        batchnorm_operation_builder.setNextRunningMeanAndVar(*(tensors.at(NEXT_RUNNING_MEAN->second->get_uid())),
-                                                             *(tensors.at(NEXT_RUNNING_VAR->second->get_uid())));
+        auto next_running_var_desc = tensors.at(NEXT_RUNNING_VAR->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(
+            detail::set_attribute(bn_finalize_operation.get_raw_desc(),
+                                  CUDNN_ATTR_OPERATION_BN_FINALIZE_UPDATED_RUNNING_VAR_DESC,
+                                  CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                  1,
+                                  &next_running_var_desc),
+            "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_UPDATED_RUNNING_VAR_DESC Failed");
 
+        // Set MEAN output tensor (saved mean)
+        CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(MEAN, BN_finalize_attributes::output_names::MEAN);
+        auto mean_desc = tensors.at(MEAN->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(
+            detail::set_attribute(bn_finalize_operation.get_raw_desc(),
+                                  CUDNN_ATTR_OPERATION_BN_FINALIZE_SAVED_MEAN_DESC,
+                                  CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                  1,
+                                  &mean_desc),
+            "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_SAVED_MEAN_DESC Failed");
+
+        // Set INV_VARIANCE output tensor (saved inv std)
+        CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(INV_VARIANCE, BN_finalize_attributes::output_names::INV_VARIANCE);
+        auto inv_var_desc = tensors.at(INV_VARIANCE->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(
+            detail::set_attribute(bn_finalize_operation.get_raw_desc(),
+                                  CUDNN_ATTR_OPERATION_BN_FINALIZE_SAVED_INV_STD_DESC,
+                                  CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                  1,
+                                  &inv_var_desc),
+            "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_SAVED_INV_STD_DESC Failed");
+
+        // Set EPSILON tensor
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(EPSILON, BN_finalize_attributes::input_names::EPSILON);
-        batchnorm_operation_builder.setEpsilonTensor(*(tensors.at(EPSILON->second->get_uid())));
+        auto epsilon_desc = tensors.at(EPSILON->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(detail::set_attribute(bn_finalize_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_BN_FINALIZE_EPSILON_DESC,
+                                                 CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                 1,
+                                                 &epsilon_desc),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_EPSILON_DESC Failed");
 
+        // Set MOMENTUM tensor (exp average factor)
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(MOMENTUM, BN_finalize_attributes::input_names::MOMENTUM);
-        batchnorm_operation_builder.setExpDecayFactorTensor(*(tensors.at(MOMENTUM->second->get_uid())));
+        auto momentum_desc = tensors.at(MOMENTUM->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(
+            detail::set_attribute(bn_finalize_operation.get_raw_desc(),
+                                  CUDNN_ATTR_OPERATION_BN_FINALIZE_EXP_AVERATE_FACTOR_DESC,
+                                  CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                  1,
+                                  &momentum_desc),
+            "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_EXP_AVERATE_FACTOR_DESC Failed");
 
+        // Set ACCUM_COUNT tensor
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(ACCUM_COUNT, BN_finalize_attributes::input_names::ACCUM_COUNT);
-        batchnorm_operation_builder.setAccumCountTensor(*(tensors.at(ACCUM_COUNT->second->get_uid())));
+        auto accum_count_desc = tensors.at(ACCUM_COUNT->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(
+            detail::set_attribute(bn_finalize_operation.get_raw_desc(),
+                                  CUDNN_ATTR_OPERATION_BN_FINALIZE_ACCUM_COUNT_DESC,
+                                  CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                  1,
+                                  &accum_count_desc),
+            "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_ACCUM_COUNT_DESC Failed");
 
-#ifdef NV_CUDNN_DISABLE_EXCEPTION
-        // disable exception macro is defined. Calling build will not throw.
-        // Check status of desc and return error.
-        auto operation = batchnorm_operation_builder.build();
-        RETURN_CUDNN_FRONTEND_ERROR_IF(operation.get_status() != CUDNN_STATUS_SUCCESS,
-                                       error_code_t::CUDNN_BACKEND_API_FAILED,
-                                       operation.get_error());
-        operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-#else
-        // build() can throw
-        // wrap in try catch
-        try {
-            auto operation = batchnorm_operation_builder.build();
-            operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-        } catch (cudnn_frontend::cudnnException& e) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                e.getCudnnStatus() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, e.what());
-        }
-#endif
+        CHECK_CUDNN_STATUS(detail::finalize(bn_finalize_operation.get_raw_desc()),
+                          "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
+
+        operations.push_back(std::make_shared<Operation_v8>(std::move(bn_finalize_operation)));
 
         auto const& non_virtual_uids = attributes.get_non_virtual_uids();
         uids_involved_in_operations.insert(non_virtual_uids.begin(), non_virtual_uids.end());

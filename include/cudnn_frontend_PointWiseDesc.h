@@ -23,6 +23,8 @@
 #pragma once
 
 #include <algorithm>
+
+namespace cudnn_frontend { namespace graph { class PointwiseNode; } }
 #include <array>
 #include <functional>
 #include <memory>
@@ -53,6 +55,7 @@ namespace cudnn_frontend {
 class PointWiseDesc_v8 : public BackendDescriptor {
    public:
     friend class PointWiseDescBuilder_v8;
+    friend class cudnn_frontend::graph::PointwiseNode;
     std::string
     describe() const override {
         std::stringstream ss;

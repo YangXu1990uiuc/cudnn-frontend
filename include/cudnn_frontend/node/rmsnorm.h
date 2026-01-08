@@ -1,8 +1,5 @@
 #pragma once
 
-#include "../../cudnn_frontend_Heuristics.h"
-#include "../../cudnn_frontend_Logging.h"
-
 #include "../graph_helpers.h"
 #include "../node_interface.h"
 
@@ -90,51 +87,103 @@ class RMSNormNode : public NodeCRTP<RMSNormNode> {
         CUDNN_FRONTEND_UNUSED(raw_operations);
         CUDNN_FE_LOG_LABEL("INFO: Building RMSNormNode operations " << attributes.name << " ");
 
-        auto&& rmsnorm_operation_builder =
-            cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_NORM_FORWARD_DESCRIPTOR);
+        // Create operation by directly calling cuDNN backend API
+        Operation_v8 rmsnorm_operation;
 
-        rmsnorm_operation_builder.setNormalizationMode(NormMode_t::RMS_NORM).setNormFwdPhase(attributes.forward_phase);
+        CHECK_CUDNN_STATUS(
+            rmsnorm_operation.initialize_managed_backend_pointer(CUDNN_BACKEND_OPERATION_NORM_FORWARD_DESCRIPTOR),
+            "CUDNN_BACKEND_OPERATION: cudnnCreate Failed");
 
+        // Set norm mode to RMS_NORM
+        cudnnBackendNormMode_t cudnn_norm_mode;
+        CHECK_CUDNN_STATUS(detail::convert_to_cudnn_type(NormMode_t::RMS_NORM, cudnn_norm_mode),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_NORM_FWD_MODE Failed");
+        CHECK_CUDNN_STATUS(detail::set_attribute(rmsnorm_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_NORM_FWD_MODE,
+                                                 CUDNN_TYPE_NORM_MODE,
+                                                 1,
+                                                 &cudnn_norm_mode),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_NORM_FWD_MODE Failed");
+
+        // Set forward phase
+        cudnnBackendNormFwdPhase_t cudnn_norm_fwd_phase;
+        CHECK_CUDNN_STATUS(detail::convert_to_cudnn_type(attributes.forward_phase, cudnn_norm_fwd_phase),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_NORM_FWD_PHASE Failed");
+        CHECK_CUDNN_STATUS(detail::set_attribute(rmsnorm_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_NORM_FWD_PHASE,
+                                                 CUDNN_TYPE_NORM_FWD_PHASE,
+                                                 1,
+                                                 &cudnn_norm_fwd_phase),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_NORM_FWD_PHASE Failed");
+
+        // Set input tensor X
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(X, Rmsnorm_attributes::input_names::X);
-        rmsnorm_operation_builder.setxDesc(*(tensors.at(X->second->get_uid())));
+        auto x_desc = tensors.at(X->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(detail::set_attribute(rmsnorm_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_NORM_FWD_XDESC,
+                                                 CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                 1,
+                                                 &x_desc),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_NORM_FWD_XDESC Failed");
 
+        // Set scale tensor
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(SCALE, Rmsnorm_attributes::input_names::SCALE);
-        rmsnorm_operation_builder.setScale(*(tensors.at(SCALE->second->get_uid())));
+        auto scale_desc = tensors.at(SCALE->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(detail::set_attribute(rmsnorm_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_NORM_FWD_SCALE_DESC,
+                                                 CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                 1,
+                                                 &scale_desc),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_NORM_FWD_SCALE_DESC Failed");
 
+        // Set epsilon tensor
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(EPSILON, Rmsnorm_attributes::input_names::EPSILON);
-        rmsnorm_operation_builder.setEpsilonTensor(*(tensors.at(EPSILON->second->get_uid())));
+        auto epsilon_desc = tensors.at(EPSILON->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(detail::set_attribute(rmsnorm_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_NORM_FWD_EPSILON_DESC,
+                                                 CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                 1,
+                                                 &epsilon_desc),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_NORM_FWD_EPSILON_DESC Failed");
 
+        // Set output tensor Y
         CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(Y, Rmsnorm_attributes::output_names::Y);
-        rmsnorm_operation_builder.setyDesc(*(tensors.at(Y->second->get_uid())));
+        auto y_desc = tensors.at(Y->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(detail::set_attribute(rmsnorm_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_NORM_FWD_YDESC,
+                                                 CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                 1,
+                                                 &y_desc),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_NORM_FWD_YDESC Failed");
 
+        // Set inv_variance for training phase
         if (attributes.forward_phase == NormFwdPhase_t::TRAINING) {
             CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(INV_VARIANCE, Rmsnorm_attributes::output_names::INV_VARIANCE);
-            rmsnorm_operation_builder.setSavedInvVar(*(tensors.at(INV_VARIANCE->second->get_uid())));
+            auto inv_var_desc = tensors.at(INV_VARIANCE->second->get_uid())->get_raw_desc();
+            CHECK_CUDNN_STATUS(detail::set_attribute(rmsnorm_operation.get_raw_desc(),
+                                                     CUDNN_ATTR_OPERATION_NORM_FWD_INV_VARIANCE_DESC,
+                                                     CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                     1,
+                                                     &inv_var_desc),
+                              "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_NORM_FWD_INV_VARIANCE_DESC Failed");
         }
 
+        // Set optional bias tensor
         auto BIAS = attributes.inputs.find(Rmsnorm_attributes::input_names::BIAS);
         if ((BIAS != attributes.inputs.end()) && (BIAS->second != nullptr)) {
-            rmsnorm_operation_builder.setBias(*(tensors.at(BIAS->second->get_uid())));
+            auto bias_desc = tensors.at(BIAS->second->get_uid())->get_raw_desc();
+            CHECK_CUDNN_STATUS(detail::set_attribute(rmsnorm_operation.get_raw_desc(),
+                                                     CUDNN_ATTR_OPERATION_NORM_FWD_BIAS_DESC,
+                                                     CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                     1,
+                                                     &bias_desc),
+                              "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_NORM_FWD_BIAS_DESC Failed");
         }
-#ifdef NV_CUDNN_DISABLE_EXCEPTION
-        // disable exception macro is defined. Calling build will not throw.
-        // Check status of desc and return error.
-        auto operation = rmsnorm_operation_builder.build();
-        RETURN_CUDNN_FRONTEND_ERROR_IF(operation.get_status() != CUDNN_STATUS_SUCCESS,
-                                       error_code_t::CUDNN_BACKEND_API_FAILED,
-                                       operation.get_error());
-        operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-#else
-        // build() can throw
-        // wrap in try catch
-        try {
-            auto operation = rmsnorm_operation_builder.build();
-            operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-        } catch (cudnn_frontend::cudnnException& e) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                e.getCudnnStatus() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, e.what());
-        }
-#endif
+
+        CHECK_CUDNN_STATUS(detail::finalize(rmsnorm_operation.get_raw_desc()),
+                          "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
+
+        operations.push_back(std::make_shared<Operation_v8>(std::move(rmsnorm_operation)));
 
         auto const& non_virtual_uids = attributes.get_non_virtual_uids();
         uids_involved_in_operations.insert(non_virtual_uids.begin(), non_virtual_uids.end());
@@ -247,52 +296,101 @@ class DRMSNormNode : public NodeCRTP<DRMSNormNode> {
         CUDNN_FRONTEND_UNUSED(raw_operations);
         CUDNN_FE_LOG_LABEL("INFO: Building DRMSNormNode operations " << attributes.name << " ");
 
-        auto&& DRMSNorm_operation_builder =
-            cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_NORM_BACKWARD_DESCRIPTOR);
+        // Create operation by directly calling cuDNN backend API
+        Operation_v8 drmsnorm_operation;
 
-        DRMSNorm_operation_builder.setNormalizationMode(NormMode_t::RMS_NORM);
+        CHECK_CUDNN_STATUS(
+            drmsnorm_operation.initialize_managed_backend_pointer(CUDNN_BACKEND_OPERATION_NORM_BACKWARD_DESCRIPTOR),
+            "CUDNN_BACKEND_OPERATION: cudnnCreate Failed");
 
+        // Set norm mode to RMS_NORM
+        cudnnBackendNormMode_t cudnn_norm_mode;
+        CHECK_CUDNN_STATUS(detail::convert_to_cudnn_type(NormMode_t::RMS_NORM, cudnn_norm_mode),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_NORM_BWD_MODE Failed");
+        CHECK_CUDNN_STATUS(detail::set_attribute(drmsnorm_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_NORM_BWD_MODE,
+                                                 CUDNN_TYPE_NORM_MODE,
+                                                 1,
+                                                 &cudnn_norm_mode),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_NORM_BWD_MODE Failed");
+
+        // Set input tensor X
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(X, Rmsnorm_backward_attributes::input_names::X);
-        DRMSNorm_operation_builder.setxDesc(*(tensors.at(X->second->get_uid())));
+        auto x_desc = tensors.at(X->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(detail::set_attribute(drmsnorm_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_NORM_BWD_XDESC,
+                                                 CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                 1,
+                                                 &x_desc),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_NORM_BWD_XDESC Failed");
 
+        // Set DY tensor
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(DY, Rmsnorm_backward_attributes::input_names::DY);
-        DRMSNorm_operation_builder.setdyDesc(*(tensors.at(DY->second->get_uid())));
+        auto dy_desc = tensors.at(DY->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(detail::set_attribute(drmsnorm_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_NORM_BWD_DYDESC,
+                                                 CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                 1,
+                                                 &dy_desc),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_NORM_BWD_DYDESC Failed");
 
+        // Set scale tensor
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(SCALE, Rmsnorm_backward_attributes::input_names::SCALE);
-        DRMSNorm_operation_builder.setScale(*(tensors.at(SCALE->second->get_uid())));
+        auto scale_desc = tensors.at(SCALE->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(detail::set_attribute(drmsnorm_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_NORM_BWD_SCALE_DESC,
+                                                 CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                 1,
+                                                 &scale_desc),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_NORM_BWD_SCALE_DESC Failed");
 
+        // Set inv_variance tensor
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(INV_VARIANCE, Rmsnorm_backward_attributes::input_names::INV_VARIANCE);
-        DRMSNorm_operation_builder.setSavedInvVar(*(tensors.at(INV_VARIANCE->second->get_uid())));
+        auto inv_var_desc = tensors.at(INV_VARIANCE->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(detail::set_attribute(drmsnorm_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_NORM_BWD_INV_VARIANCE_DESC,
+                                                 CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                 1,
+                                                 &inv_var_desc),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_NORM_BWD_INV_VARIANCE_DESC Failed");
 
+        // Set DSCALE output tensor
         CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DSCALE, Rmsnorm_backward_attributes::output_names::DSCALE);
-        DRMSNorm_operation_builder.setDScale(*(tensors.at(DSCALE->second->get_uid())));
+        auto dscale_desc = tensors.at(DSCALE->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(detail::set_attribute(drmsnorm_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_NORM_BWD_DSCALE_DESC,
+                                                 CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                 1,
+                                                 &dscale_desc),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_NORM_BWD_DSCALE_DESC Failed");
 
+        // Set optional DBIAS output tensor
         if (attributes.use_dbias.value()) {
             CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DBIAS, Rmsnorm_backward_attributes::output_names::DBIAS);
-            DRMSNorm_operation_builder.setDBias(*(tensors.at(DBIAS->second->get_uid())));
+            auto dbias_desc = tensors.at(DBIAS->second->get_uid())->get_raw_desc();
+            CHECK_CUDNN_STATUS(detail::set_attribute(drmsnorm_operation.get_raw_desc(),
+                                                     CUDNN_ATTR_OPERATION_NORM_BWD_DBIAS_DESC,
+                                                     CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                     1,
+                                                     &dbias_desc),
+                              "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_NORM_BWD_DBIAS_DESC Failed");
         }
 
+        // Set DX output tensor
         CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DX, Rmsnorm_backward_attributes::output_names::DX);
-        DRMSNorm_operation_builder.setdxDesc(*(tensors.at(DX->second->get_uid())));
-#ifdef NV_CUDNN_DISABLE_EXCEPTION
-        // disable exception macro is defined. Calling build will not throw.
-        // Check status of desc and return error.
-        auto operation = DRMSNorm_operation_builder.build();
-        RETURN_CUDNN_FRONTEND_ERROR_IF(operation.get_status() != CUDNN_STATUS_SUCCESS,
-                                       error_code_t::CUDNN_BACKEND_API_FAILED,
-                                       operation.get_error());
-        operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-#else
-        // build() can throw
-        // wrap in try catch
-        try {
-            auto operation = DRMSNorm_operation_builder.build();
-            operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-        } catch (cudnn_frontend::cudnnException& e) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                e.getCudnnStatus() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, e.what());
-        }
-#endif
+        auto dx_desc = tensors.at(DX->second->get_uid())->get_raw_desc();
+        CHECK_CUDNN_STATUS(detail::set_attribute(drmsnorm_operation.get_raw_desc(),
+                                                 CUDNN_ATTR_OPERATION_NORM_BWD_DXDESC,
+                                                 CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                 1,
+                                                 &dx_desc),
+                          "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_NORM_BWD_DXDESC Failed");
+
+        CHECK_CUDNN_STATUS(detail::finalize(drmsnorm_operation.get_raw_desc()),
+                          "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
+
+        operations.push_back(std::make_shared<Operation_v8>(std::move(drmsnorm_operation)));
+
         auto const& non_virtual_uids = attributes.get_non_virtual_uids();
         uids_involved_in_operations.insert(non_virtual_uids.begin(), non_virtual_uids.end());
         return {error_code_t::OK, ""};
