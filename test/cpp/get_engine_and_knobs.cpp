@@ -66,26 +66,32 @@ TEST_CASE("get_engine_and_knobs_at_index round-trips via create_execution_plan",
     REQUIRE(graph->get_engine_and_knobs_at_index(-1, engine_id, knobs).is_bad());
     REQUIRE(graph->get_engine_and_knobs_at_index(count, engine_id, knobs).is_bad());
 
-    // The getter must succeed for every plan; pinning it back via
-    // create_execution_plan must reproduce the *same* kernel (matching name).
-    // Not every heuristic-enumerated engine is standalone-constructable, so the
-    // re-pin is best-effort -- but at least one must round-trip.
+    // For every plan: the reported (engine, knobs) must feed straight back into
+    // create_execution_plan -- i.e. every backend knob type the engine uses is
+    // representable as a KnobType_t. Building the pinned plan is best-effort
+    // (it can fail for environment reasons, e.g. a ptxas older than the
+    // engine's target); when it succeeds it must reproduce the same plan.
     int64_t round_tripped = 0;
     for (int64_t i = 0; i < count; i++) {
-        std::string name;
-        REQUIRE(graph->get_plan_name_at_index(i, name).is_good());
-
         engine_id = -1;
         knobs.clear();
         REQUIRE(graph->get_engine_and_knobs_at_index(i, engine_id, knobs).is_good());
         REQUIRE(engine_id >= 0);
 
         auto pinned = make_matmul_graph(handle);
-        if (pinned->create_execution_plan(engine_id, knobs).is_good() && pinned->build_plans().is_good()) {
+        REQUIRE(pinned->create_execution_plan(engine_id, knobs).is_good());
+
+        if (pinned->build_plans().is_good()) {
             REQUIRE(pinned->get_execution_plan_count() == 1);
-            std::string pinned_name;
-            REQUIRE(pinned->get_plan_name_at_index(0, pinned_name).is_good());
-            REQUIRE(pinned_name == name);
+            // Compare the structured identity (engine + knob map), not the tag
+            // string: the tag serializes knobs in engine-config order, which
+            // differs between the heuristic and pinned configs, but the engine
+            // id + knob values are what define the kernel.
+            int64_t pinned_engine = -1;
+            std::unordered_map<fe::KnobType_t, int64_t> pinned_knobs;
+            REQUIRE(pinned->get_engine_and_knobs_at_index(0, pinned_engine, pinned_knobs).is_good());
+            REQUIRE(pinned_engine == engine_id);
+            REQUIRE(pinned_knobs == knobs);
             round_tripped++;
         }
     }
