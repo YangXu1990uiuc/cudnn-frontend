@@ -26,6 +26,7 @@
 #include <string>
 #include <variant>
 #include <vector>
+#include <utility>
 #include <iomanip>
 #include <sstream>
 #include <cmath>
@@ -2609,6 +2610,86 @@ std::string static get_engine_tag(ManagedOpaqueDescriptor const config) {
         tag << "_k" << type << "=" << choice;
     }
     return tag.str();
+}
+
+// Structured counterpart of get_engine_tag(): returns the engine's global
+// index and its (knob type, value) choices instead of a formatted string.
+// Reads the exact same backend attributes get_engine_tag() stringifies, so a
+// caller can pin a specific plan via Graph::create_execution_plan() (which
+// takes an engine id + knob choices) on a freshly built graph -- skipping the
+// heuristics query entirely -- instead of parsing the tag string or relying
+// on a positional plan index that can drift across library versions.
+cudnnStatus_t static get_engine_id_and_knobs(ManagedOpaqueDescriptor const config,
+                                             int64_t& engineId,
+                                             std::vector<std::pair<cudnnBackendKnobType_t, int64_t>>& knobs) {
+    engineId = -1;
+    knobs.clear();
+
+    ManagedOpaqueDescriptor extractedEngine = make_shared_backend_pointer(CUDNN_BACKEND_ENGINE_DESCRIPTOR);
+    if (extractedEngine->get_status() != CUDNN_STATUS_SUCCESS) {
+        return extractedEngine->get_status();
+    }
+    cudnnBackendDescriptor_t extractedEngine_ = extractedEngine->get_backend_descriptor();
+
+    int64_t elemCount = 0;
+    auto status       = detail::get_attribute(config->get_backend_descriptor(),
+                                        CUDNN_ATTR_ENGINECFG_ENGINE,
+                                        CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                        1,
+                                        &elemCount,
+                                        &extractedEngine_);
+    if (status != CUDNN_STATUS_SUCCESS) {
+        return status;
+    }
+
+    std::array<ManagedOpaqueDescriptor, CUDNN_KNOB_TYPE_COUNTS> extractedKnobs{{nullptr}};
+    for (auto& knob : extractedKnobs) {
+        knob = make_shared_backend_pointer(CUDNN_BACKEND_KNOB_CHOICE_DESCRIPTOR);
+        if (knob->get_status() != CUDNN_STATUS_SUCCESS) {
+            return knob->get_status();
+        }
+    }
+    std::array<cudnnBackendDescriptor_t, CUDNN_KNOB_TYPE_COUNTS> extractedKnobs_{{nullptr}};
+    for (std::uint32_t i = 0; i < extractedKnobs.size(); i++) {
+        extractedKnobs_[i] = extractedKnobs[i]->get_backend_descriptor();
+    }
+
+    status = detail::get_attribute(
+        extractedEngine_, CUDNN_ATTR_ENGINE_GLOBAL_INDEX, CUDNN_TYPE_INT64, 1, &elemCount, &engineId);
+    if (status != CUDNN_STATUS_SUCCESS) {
+        return status;
+    }
+
+    int64_t numKnobs = 0;
+    status           = detail::get_attribute(config->get_backend_descriptor(),
+                                   CUDNN_ATTR_ENGINECFG_KNOB_CHOICES,
+                                   CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                   CUDNN_KNOB_TYPE_COUNTS,
+                                   &numKnobs,
+                                   &(extractedKnobs_[0]));
+    if (status != CUDNN_STATUS_SUCCESS) {
+        return status;
+    }
+    if (numKnobs > CUDNN_KNOB_TYPE_COUNTS) {
+        return CUDNN_STATUS_NOT_SUPPORTED;
+    }
+
+    knobs.reserve(static_cast<size_t>(numKnobs));
+    for (size_t idx = 0; idx < static_cast<size_t>(numKnobs); ++idx) {
+        const cudnnBackendDescriptor_t& knob = extractedKnobs_[idx];
+        cudnnBackendKnobType_t type          = CUDNN_KNOB_TYPE_COUNTS;
+        int64_t choice                       = -2;
+        status = detail::get_attribute(knob, CUDNN_ATTR_KNOB_CHOICE_KNOB_TYPE, CUDNN_TYPE_KNOB_TYPE, 1, nullptr, &type);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            return status;
+        }
+        status = detail::get_attribute(knob, CUDNN_ATTR_KNOB_CHOICE_KNOB_VALUE, CUDNN_TYPE_INT64, 1, nullptr, &choice);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            return status;
+        }
+        knobs.emplace_back(type, choice);
+    }
+    return CUDNN_STATUS_SUCCESS;
 }
 
 }  // namespace detail
