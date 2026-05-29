@@ -24,6 +24,7 @@
 #include <exception>
 #include <optional>
 #include <string>
+#include <algorithm>
 #include <variant>
 #include <vector>
 #include <utility>
@@ -2595,6 +2596,8 @@ std::string static get_engine_tag(ManagedOpaqueDescriptor const config) {
         return "INVALID_ENGINE_NAME_KNOB_COUNT";
     }
 
+    std::vector<std::pair<cudnnBackendKnobType_t, int64_t>> knob_choices;
+    knob_choices.reserve(static_cast<size_t>(numKnobs));
     for (size_t idx = 0; idx < static_cast<size_t>(numKnobs); ++idx) {
         const cudnnBackendDescriptor_t& knob = extractedKnobs_[idx];
         cudnnBackendKnobType_t type          = CUDNN_KNOB_TYPE_COUNTS;
@@ -2607,6 +2610,14 @@ std::string static get_engine_tag(ManagedOpaqueDescriptor const config) {
         if (status != CUDNN_STATUS_SUCCESS) {
             return "INVALID_ENGINE_NAME_KNOB_CHOICE_KNOB_VALUE";
         }
+        knob_choices.emplace_back(type, choice);
+    }
+    // Sort by knob type so the tag is a deterministic function of the engine
+    // config -- the knob-choice array order differs between the heuristics path
+    // and create_execution_plan (which iterates an unordered_map), but the
+    // engine + knob values are identical.
+    std::sort(knob_choices.begin(), knob_choices.end());
+    for (auto const& [type, choice] : knob_choices) {
         tag << "_k" << type << "=" << choice;
     }
     return tag.str();

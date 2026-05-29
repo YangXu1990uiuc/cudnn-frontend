@@ -73,6 +73,9 @@ TEST_CASE("get_engine_and_knobs_at_index round-trips via create_execution_plan",
     // engine's target); when it succeeds it must reproduce the same plan.
     int64_t round_tripped = 0;
     for (int64_t i = 0; i < count; i++) {
+        std::string name;
+        REQUIRE(graph->get_plan_name_at_index(i, name).is_good());
+
         engine_id = -1;
         knobs.clear();
         REQUIRE(graph->get_engine_and_knobs_at_index(i, engine_id, knobs).is_good());
@@ -83,15 +86,21 @@ TEST_CASE("get_engine_and_knobs_at_index round-trips via create_execution_plan",
 
         if (pinned->build_plans().is_good()) {
             REQUIRE(pinned->get_execution_plan_count() == 1);
-            // Compare the structured identity (engine + knob map), not the tag
-            // string: the tag serializes knobs in engine-config order, which
-            // differs between the heuristic and pinned configs, but the engine
-            // id + knob values are what define the kernel.
+
+            // Structured identity (engine + knob map) must match.
             int64_t pinned_engine = -1;
             std::unordered_map<fe::KnobType_t, int64_t> pinned_knobs;
             REQUIRE(pinned->get_engine_and_knobs_at_index(0, pinned_engine, pinned_knobs).is_good());
             REQUIRE(pinned_engine == engine_id);
             REQUIRE(pinned_knobs == knobs);
+
+            // The plan-name tag is canonical (get_engine_tag sorts knobs by
+            // type), so it must match too despite the two configs storing
+            // knob choices in different orders.
+            std::string pinned_name;
+            REQUIRE(pinned->get_plan_name_at_index(0, pinned_name).is_good());
+            REQUIRE(pinned_name == name);
+
             round_tripped++;
         }
     }
