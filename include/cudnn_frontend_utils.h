@@ -2612,13 +2612,8 @@ std::string static get_engine_tag(ManagedOpaqueDescriptor const config) {
     return tag.str();
 }
 
-// Structured counterpart of get_engine_tag(): returns the engine's global
-// index and its (knob type, value) choices instead of a formatted string.
-// Reads the exact same backend attributes get_engine_tag() stringifies, so a
-// caller can pin a specific plan via Graph::create_execution_plan() (which
-// takes an engine id + knob choices) on a freshly built graph -- skipping the
-// heuristics query entirely -- instead of parsing the tag string or relying
-// on a positional plan index that can drift across library versions.
+// Structured counterpart of get_engine_tag(): engine global index + (knob type,
+// value) choices instead of a formatted string. Reads the same backend attributes.
 cudnnStatus_t static get_engine_id_and_knobs(ManagedOpaqueDescriptor const config,
                                              int64_t& engineId,
                                              std::vector<std::pair<cudnnBackendKnobType_t, int64_t>>& knobs) {

@@ -1007,10 +1007,8 @@ class Graph : public ICudnn, public INode {
         return ret_val;
     }
 
-    // Structured counterpart of get_plan_name_at_index(): returns the engine
-    // global index and (KnobType_t, value) choices for the plan, suitable for
-    // pinning the same kernel later via create_execution_plan() without a
-    // heuristics query.
+    // Structured counterpart of get_plan_name_at_index(): engine index + knob
+    // choices, for replay via create_execution_plan().
     error_t
     get_engine_and_knobs_at_index(int64_t plan_index,
                                   int64_t &engine_id,

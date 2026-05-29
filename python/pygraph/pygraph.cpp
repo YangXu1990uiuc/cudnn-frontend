@@ -1338,16 +1338,11 @@ init_pygraph_submodule(py::module_& m) {
              &PyGraph::get_engine_and_knobs_at_index,
              py::arg("index"),
              R"pbdoc(
-                    Get the engine id and knob choices for the plan at the given index.
-
-                    This is the structured counterpart of get_plan_name_at_index: the
-                    returned (engine_id, {knob_type: value}) can be passed back to
-                    create_execution_plan() to rebuild the exact same kernel without a
-                    heuristics query, and survives plan re-enumeration across versions.
+                    Get the engine id and knob choices for a plan at the given index.
+                    Structured counterpart of get_plan_name_at_index; the result can be
+                    passed to create_execution_plan() to rebuild the same kernel.
                     Args:
                     index (int): The index of the plan to query.
-                    Returns:
-                    tuple[int, dict[knob_type, int]]: engine global index and knob choices.
                 )pbdoc")
         .def("_execute",
              &PyGraph::execute,

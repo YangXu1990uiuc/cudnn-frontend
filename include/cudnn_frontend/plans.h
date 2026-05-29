@@ -480,16 +480,15 @@ class Execution_plan_list {
         return {error_code_t::OK, ""};
     }
 
-    // Structured counterpart of get_name_at_index(): returns the engine global
-    // index and the (KnobType_t, value) choices for the plan at `index`.
-    // The returned pair can be fed straight back into
-    // Graph::create_execution_plan(engine_id, knobs) to rebuild the exact same
-    // kernel without a heuristics query -- and, unlike a positional plan index,
-    // it survives plan-list re-enumeration across cudnn-frontend versions.
+    // Structured counterpart of get_name_at_index(): engine index + knob choices,
+    // suitable for replay via Graph::create_execution_plan(engine_id, knobs).
     error_t
     get_engine_and_knobs_at_index(int64_t index,
                                   int64_t& engine_id,
                                   std::unordered_map<KnobType_t, int64_t>& knobs) const {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(index < 0 || index >= static_cast<int64_t>(engine_configs.size()),
+                                       error_code_t::GRAPH_EXECUTION_FAILED,
+                                       "Plan index " + std::to_string(index) + " is invalid.");
         std::vector<std::pair<cudnnBackendKnobType_t, int64_t>> backend_knobs;
         auto status = detail::get_engine_id_and_knobs(engine_configs[index], engine_id, backend_knobs);
         RETURN_CUDNN_FRONTEND_ERROR_IF(
