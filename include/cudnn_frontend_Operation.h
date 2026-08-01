@@ -1823,8 +1823,20 @@ class OperationBuilder_v8 {
         }
 
 #if (CUDNN_VERSION >= 92200)
-        // Set reshape mode if it's not NOT_SET
-        if (m_operation.reshape_mode != ReshapeMode_t::NOT_SET) {
+        // Same runtime-vs-compile-time split as cudnn_frontend/node/reshape.h: the attribute does
+        // not exist before 9.22 and setting it there returns BAD_PARAM. This builder defaults
+        // reshape_mode to VIEW_ONLY, not NOT_SET, so without the runtime check *every* legacy
+        // reshape sends it. A pre-9.22 reshape is view-only by construction, so only an explicit
+        // LOGICAL request has to be refused rather than silently downgraded.
+        if (detail::get_backend_version() < 92200) {
+            if (m_operation.reshape_mode == ReshapeMode_t::LOGICAL) {
+                set_error_and_throw_exception(
+                    &m_operation,
+                    CUDNN_STATUS_NOT_SUPPORTED,
+                    "CUDNN_BACKEND_OPERATION: ReshapeMode_t::LOGICAL needs a cuDNN 9.22 or newer runtime");
+                return std::move(m_operation);
+            }
+        } else if (m_operation.reshape_mode != ReshapeMode_t::NOT_SET) {
             cudnnBackendReshapeMode_t cudnn_reshape_mode;
             status = detail::convert_to_cudnn_type(m_operation.reshape_mode, cudnn_reshape_mode);
             if (status == CUDNN_STATUS_SUCCESS) {

@@ -107,14 +107,28 @@ class ReshapeNode : public NodeCRTP<ReshapeNode> {
                                                        1,
                                                        &x_desc));
 #if (CUDNN_VERSION >= 92200)
-        // Set reshape mode
-        cudnnBackendReshapeMode_t cudnn_reshape_mode;
-        _CUDNN_CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(attributes.get_reshape_mode(), cudnn_reshape_mode));
-        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(reshape_operation.get_raw_desc(),
-                                                       CUDNN_ATTR_OPERATION_RESHAPE_MODE,
-                                                       CUDNN_TYPE_RESHAPE_MODE,
-                                                       1,
-                                                       &cudnn_reshape_mode));
+        // The `#if` is on the headers; the attribute's existence is a property of the library we
+        // are linked against at run time, and the two can differ. Setting it against a pre-9.22
+        // library returns BAD_PARAM and fails the whole operation -- which takes all of SDPA
+        // backward with it, since CompositeSDPABackwardNode builds three Reshape nodes.
+        if (detail::get_backend_version() >= 92200) {
+            // Set reshape mode
+            cudnnBackendReshapeMode_t cudnn_reshape_mode;
+            _CUDNN_CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(attributes.get_reshape_mode(), cudnn_reshape_mode));
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(reshape_operation.get_raw_desc(),
+                                                           CUDNN_ATTR_OPERATION_RESHAPE_MODE,
+                                                           CUDNN_TYPE_RESHAPE_MODE,
+                                                           1,
+                                                           &cudnn_reshape_mode));
+        } else {
+            // A pre-9.22 reshape is view-only by construction, so VIEW_ONLY and NOT_SET are the
+            // modes it can honour. Silently downgrading an explicit LOGICAL request would change
+            // the semantics the caller asked for.
+            RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.get_reshape_mode() == ReshapeMode_t::LOGICAL,
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "ReshapeMode_t::LOGICAL needs a cuDNN 9.22 or newer "
+                                           "runtime; this one has no reshape-mode attribute.");
+        }
 #endif
         // Set output tensor Y
         CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(Y, Reshape_attributes::output_names::Y);
