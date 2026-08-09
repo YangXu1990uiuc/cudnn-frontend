@@ -1,5 +1,5 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tiny IR describing a matmul + pointwise-epilogue fusion — the contract
 between `graph_analyzer.py` (builds it from a cuDNN graph) and

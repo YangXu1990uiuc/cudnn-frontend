@@ -103,9 +103,11 @@ surviving external line(s) in each file (blame on `origin/develop`).
 > Note: `dlpack_version.txt` is a plain version-string file that cannot carry
 > a header comment; it is listed here and governed by MIT via this manifest.
 
-## Category 2 — MIT, third-party-derived (29 files)
+## Category 2 — MIT, third-party-derived (30 files)
 
-Derived from FlashAttention (BSD-3-Clause) and/or QuACK (Apache-2.0); they
+`include/cudnn_frontend/thirdparty/nlohmann/json.hpp` is vendored upstream
+(nlohmann/json, MIT) and keeps its own header; see THIRD_PARTY_LICENSES.txt.
+The rest are derived from FlashAttention (BSD-3-Clause) and/or QuACK (Apache-2.0); they
 retain their original authors' copyright notices. See THIRD_PARTY_LICENSES.txt.
 The commit link(s) are the NVIDIA import commits that introduced the surviving
 derived lines.
