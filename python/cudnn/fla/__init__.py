@@ -6,13 +6,15 @@
 ``accelerate_fla()`` monkeypatches FLA entry points cuDNN can serve and
 transparently calls the original implementation for unsupported configurations.
 The backward-compatible no-argument call enables the linear-attention targets
-(``gated_delta_rule`` and ``kda``).  The dense MLP adapter is intentionally
-opt-in because it has a narrower FLA 0.5.2/local-module contract::
+(``gated_delta_rule`` and ``kda``).  Dense MLP and bulk causal-convolution
+adapters are intentionally opt-in because they have narrower FLA 0.5.2
+contracts::
 
     import cudnn.fla
 
     cudnn.fla.accelerate_fla()                    # GDN + KDA, as before
     cudnn.fla.accelerate_fla(targets="gated_mlp") # incremental MLP opt-in
+    cudnn.fla.accelerate_fla(targets="causal_conv1d_fwd") # dense bulk forward
 
 Targets can be enabled and restored independently.  Every adapter is
 fail-closed: an incompatible installed FLA target rejects explicit activation,
@@ -24,16 +26,33 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib
+from importlib import metadata
+import inspect
+from pathlib import Path
 import sys
 from typing import Callable, Iterable
 
+from .causal_conv1d import last_path as conv_last_path
+from .causal_conv1d import make_causal_conv1d_fwd
+from .causal_conv1d import path_counts as conv_path_counts
+from .causal_conv1d import reset_path_counts as reset_conv_path_counts
+from .causal_conv1d import supports_installed_fla as _conv_supports_installed_fla
 from .gated_delta_rule import make_chunk_gated_delta_rule, last_path
 from .gated_mlp import last_path as mlp_last_path
 from .gated_mlp import make_gated_mlp_forward
 from .gated_mlp import _supports_installed_fla
 from .kda import make_chunk_kda
 
-__all__ = ["accelerate_fla", "is_accelerated", "last_path", "mlp_last_path", "restore_fla"]
+__all__ = [
+    "accelerate_fla",
+    "conv_last_path",
+    "conv_path_counts",
+    "is_accelerated",
+    "last_path",
+    "mlp_last_path",
+    "reset_conv_path_counts",
+    "restore_fla",
+]
 
 
 @dataclass(frozen=True)
@@ -74,6 +93,146 @@ def _gated_mlp_replacement(module, owner, original):
     return make_gated_mlp_forward(original, owner, swiglu_linear_cls)
 
 
+_CAUSAL_CONV_PARAMETER_CONTRACT = (
+    ("x", inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.empty),
+    ("weight", inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.empty),
+    ("bias", inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.empty),
+    ("residual", inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.empty),
+    ("initial_state", inspect.Parameter.POSITIONAL_OR_KEYWORD, None),
+    ("output_final_state", inspect.Parameter.POSITIONAL_OR_KEYWORD, False),
+    ("activation", inspect.Parameter.POSITIONAL_OR_KEYWORD, None),
+    ("cu_seqlens", inspect.Parameter.POSITIONAL_OR_KEYWORD, None),
+    ("cu_seqlens_cpu", inspect.Parameter.POSITIONAL_OR_KEYWORD, None),
+    ("chunk_indices", inspect.Parameter.POSITIONAL_OR_KEYWORD, None),
+    ("BT", inspect.Parameter.POSITIONAL_OR_KEYWORD, 64),
+    ("layout_fallback", inspect.Parameter.POSITIONAL_OR_KEYWORD, False),
+)
+
+
+def _function_chain(function):
+    """Return a transparent-wrapper chain, or None for a non-function/cycle."""
+
+    chain = []
+    seen = set()
+    current = function
+    while True:
+        if not inspect.isfunction(current) or id(current) in seen:
+            return None
+        seen.add(id(current))
+        chain.append(current)
+        if not hasattr(current, "__wrapped__"):
+            return tuple(chain)
+        current = current.__wrapped__
+
+
+def _stock_causal_conv_wrapper_codes():
+    """Recreate only FLA's decorators to identify their runtime code frames."""
+
+    from fla.ops.backends import dispatch
+    from fla.utils import input_guard
+
+    def causal_conv1d_fwd(
+        x,
+        weight,
+        bias,
+        residual,
+        initial_state=None,
+        output_final_state=False,
+        activation=None,
+        cu_seqlens=None,
+        cu_seqlens_cpu=None,
+        chunk_indices=None,
+        BT=64,
+        layout_fallback=False,
+    ):
+        del (
+            x,
+            weight,
+            bias,
+            residual,
+            initial_state,
+            output_final_state,
+            activation,
+            cu_seqlens,
+            cu_seqlens_cpu,
+            chunk_indices,
+            BT,
+            layout_fallback,
+        )
+
+    wrapped = input_guard(no_guard_contiguous=["x"])(causal_conv1d_fwd)
+    wrapped = dispatch("modules")(wrapped)
+    chain = _function_chain(wrapped)
+    if chain is None:
+        raise RuntimeError("could not identify the stock FLA decorator chain")
+    return tuple(function.__code__ for function in chain[:-1])
+
+
+def _fla_core_owns_module_file(module_file: Path) -> bool:
+    """Reject PYTHONPATH/edit collisions not owned by one fla-core install."""
+
+    distributions = [
+        distribution for distribution in metadata.distributions() if (distribution.metadata.get("Name") or "").lower().replace("_", "-") == "fla-core"
+    ]
+    if len(distributions) != 1:
+        return False
+    distribution = distributions[0]
+    return any(
+        Path(distribution.locate_file(entry)).resolve() == module_file
+        for entry in (distribution.files or ())
+        if Path(entry).as_posix().endswith("fla/modules/conv/triton/ops.py")
+    )
+
+
+def _matches_stock_causal_conv_callable(module, original) -> bool:
+    """Match FLA's raw op plus the decorators active in this exact runtime."""
+
+    try:
+        chain = _function_chain(original)
+        if chain is None:
+            return False
+        raw = chain[-1]
+        wrapper_codes = tuple(function.__code__ for function in chain[:-1])
+        parameters = tuple(
+            (parameter.name, parameter.kind, parameter.default) for parameter in inspect.signature(raw, follow_wrapped=False).parameters.values()
+        )
+        module_file = Path(module.__file__).resolve()
+        raw_file = Path(raw.__code__.co_filename).resolve()
+        return (
+            wrapper_codes == _stock_causal_conv_wrapper_codes()
+            and raw.__module__ == module.__name__
+            and raw.__qualname__ == "causal_conv1d_fwd"
+            and parameters == _CAUSAL_CONV_PARAMETER_CONTRACT
+            and raw_file == module_file
+            and _fla_core_owns_module_file(module_file)
+        )
+    except (AttributeError, ImportError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _causal_conv_replacement(module, owner, original):
+    del owner
+    if not _conv_supports_installed_fla():
+        raise ImportError("the cuDNN causal-conv shim requires flash-linear-attention==0.5.2 and fla-core==0.5.2")
+    if getattr(module, "causal_conv1d_fwd", None) is not original:
+        raise ImportError("FLA causal_conv1d_fwd does not match the expected module owner")
+    if not _matches_stock_causal_conv_callable(module, original):
+        raise ImportError("FLA causal_conv1d_fwd was replaced or does not match the supported 0.5.2 callable")
+    if getattr(original, "__cudnn_fla_target__", None) is not None:
+        raise ImportError("FLA causal_conv1d_fwd was replaced before cuDNN acceleration")
+    # Importing the native package here makes explicit target activation fail
+    # atomically when its optional CuTeDSL dependency is unavailable.
+    try:
+        from cudnn.causal_conv1d_bulk_sm100 import causal_conv1d_bulk_fwd_wrapper_sm100  # noqa: F401
+        from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+    except (ImportError, OSError) as error:
+        raise ImportError(f"the cuDNN bulk causal-conv forward is unavailable: {error}") from error
+    installed, version = cutedsl_state()
+    if not installed or cutedsl_too_old(version):
+        raise ImportError("the cuDNN bulk causal-conv forward requires nvidia-cutlass-dsl>=4.7.0")
+    return make_causal_conv1d_fwd(original)
+
+
 _TARGETS = {
     "gated_delta_rule": _PatchSpec(
         "fla.ops.gated_delta_rule",
@@ -92,8 +251,14 @@ _TARGETS = {
         owner_attribute="GatedMLP",
         default=False,
     ),
+    "causal_conv1d_fwd": _PatchSpec(
+        "fla.modules.conv.triton.ops",
+        "causal_conv1d_fwd",
+        _causal_conv_replacement,
+        default=False,
+    ),
 }
-_ALIASES = {"gdn": "gated_delta_rule", "mlp": "gated_mlp"}
+_ALIASES = {"gdn": "gated_delta_rule", "mlp": "gated_mlp", "conv": "causal_conv1d_fwd"}
 _DEFAULT_TARGETS = tuple(name for name, spec in _TARGETS.items() if spec.default)
 _ORIGINALS: dict[str, _AppliedPatch] = {}
 
@@ -157,8 +322,9 @@ def accelerate_fla(verbose: bool = True, *, targets: str | Iterable[str] | None 
     """Patch selected FLA targets, incrementally and idempotently.
 
     ``targets=None`` preserves the original behavior and enables only GDN/KDA.
-    Use ``targets="gated_mlp"`` (or the ``"mlp"`` alias) for the opt-in dense
-    MLP adapter.  A string or iterable of strings is accepted.
+    Use ``targets="gated_mlp"`` (or ``"mlp"``) for the opt-in dense MLP
+    adapter and ``targets="causal_conv1d_fwd"`` (or ``"conv"``) for the
+    dense bulk causal-convolution forward. A string or iterable is accepted.
     """
     requested = _normalize_targets(targets, default=_DEFAULT_TARGETS)
     available = {target for target in requested if is_accelerated(target)}
