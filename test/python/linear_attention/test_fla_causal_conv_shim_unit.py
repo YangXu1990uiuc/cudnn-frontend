@@ -7,11 +7,10 @@ import functools
 import sys
 import types
 
-import pytest
-import torch
-
 import cudnn.fla as fla_api
 import cudnn.fla.causal_conv1d as conv_shim
+import pytest
+import torch
 
 pytestmark = pytest.mark.L0
 
@@ -96,6 +95,44 @@ def test_supported_call_uses_native_and_translates_outputs(monkeypatch, admit_cp
     assert calls == []
     assert conv_shim.last_path() == "native"
     assert conv_shim.path_counts() == {"native": 1}
+
+
+@pytest.mark.parametrize(
+    "capability,expected_path",
+    [
+        ((8, 0), "native"),
+        ((8, 9), "native"),
+        ((9, 0), "native"),
+        ((10, 0), "native"),
+        ((10, 3), "native"),
+        ((11, 0), "native"),
+        ((12, 0), "native"),
+        ((12, 1), "native"),
+        ((7, 5), "fallback:unsupported-arch"),
+        ((10, 1), "fallback:unsupported-arch"),
+    ],
+)
+def test_architecture_policy_matches_native_api(monkeypatch, admit_cpu_tensors, capability, expected_path):
+    x, weight = _operands()
+    monkeypatch.setattr(conv_shim, "_device_capability", lambda device: capability)
+    monkeypatch.setattr(conv_shim, "_call_native", lambda *args: (torch.empty_like(x), None))
+    shim = conv_shim.make_causal_conv1d_fwd(lambda **kwargs: "fallback")
+
+    with torch.no_grad():
+        _call(shim, x, weight)
+
+    assert conv_shim.last_path() == expected_path
+
+
+def test_pre_blackwell_divisible_width_obeys_scalar_index_limit(monkeypatch, admit_cpu_tensors):
+    x, weight = _operands()
+    monkeypatch.setattr(conv_shim, "_device_capability", lambda device: (9, 0))
+    monkeypatch.setattr(conv_shim, "_INT32_MAX", 31)
+    monkeypatch.setattr(conv_shim, "_call_native", lambda *args: pytest.fail("scalar index overflow must decline"))
+    shim = conv_shim.make_causal_conv1d_fwd(lambda **kwargs: "fallback")
+
+    assert _call(shim, x, weight) == "fallback"
+    assert conv_shim.last_path() == "fallback:scalar-index-limit"
 
 
 @pytest.mark.parametrize(

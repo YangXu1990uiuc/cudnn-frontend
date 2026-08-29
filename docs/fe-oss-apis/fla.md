@@ -21,7 +21,7 @@ cudnn.fla.accelerate_fla()
 # Incrementally opt the dense FLA GatedMLP into the fused cuDNN SwiGLU MLP.
 cudnn.fla.accelerate_fla(targets="gated_mlp")
 
-# Opt the dense bulk causal-convolution forward into the SM100 CuTeDSL kernel.
+# Opt the dense bulk causal-convolution forward into the native CuTeDSL kernel.
 cudnn.fla.accelerate_fla(targets="causal_conv1d_fwd")
 
 # A string or iterable is accepted; "gdn", "mlp", and "conv" are aliases.
@@ -47,12 +47,18 @@ The `causal_conv1d_fwd` target currently admits exactly
 `flash-linear-attention==0.5.2` with its code-owning `fla-core==0.5.2`
 distribution, and FLA's dense,
 contiguous BF16 `[batch, tokens, channels]` input with a contiguous BF16
-`[channels, 4]` weight, no bias or residual, `silu`/`swish` activation, and an
-exact SM100 device. It supports an optional BF16
+`[channels, 4]` weight, no bias or residual, `silu`/`swish` activation, and a
+native functional target (SM80/86/87/89/90/100/103/110/120/121). It supports an optional BF16
 `[batch, channels, 4]` initial state and optional final-state output. Packed
 sequence metadata, other layouts/dtypes/architectures, non-BF16 autocast,
 graph compilation, and direct grad-enabled calls execute the original FLA
 function.
+
+The native API selects its schedule from the exact target: SM80-SM90 use the
+ordinary-FP32 scalar path, while listed SM100-or-newer targets may use the
+packed-FP32 vec8 path for channel widths divisible by eight. Only the B200
+schedule has been performance-characterized; other architectures are
+functional support and the adapter makes no speedup claim for them.
 
 This target replaces only FLA's low-level forward. During a default Triton
 autograd call, cuDNN serves the dense forward while FLA continues to own the

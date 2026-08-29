@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""B200 parity and route proof for the opt-in FLA causal-conv forward shim."""
+"""Parity and route proof for the opt-in FLA causal-conv forward shim."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ try:
 except metadata.PackageNotFoundError:
     _FLA_VERSION = None
 
+from cudnn._causal_conv1d_bulk_arch import FUNCTIONAL_COMPUTE_CAPABILITIES
 from cudnn.fla import (
     accelerate_fla,
     conv_last_path,
@@ -32,8 +33,8 @@ pytestmark = [
     pytest.mark.gpu_exclusive,
     pytest.mark.xdist_group(name="gpu_exclusive"),
     pytest.mark.skipif(
-        not (torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)),
-        reason="the bulk causal-conv forward requires exactly SM100",
+        not (torch.cuda.is_available() and torch.cuda.get_device_capability() in FUNCTIONAL_COMPUTE_CAPABILITIES),
+        reason="the bulk causal-conv forward requires a supported architecture",
     ),
     pytest.mark.skipif(
         _FLA_VERSION != "0.5.2",

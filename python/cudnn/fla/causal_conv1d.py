@@ -13,13 +13,14 @@ contract for metadata that FLA accepted before patching.
 
 from __future__ import annotations
 
-from collections import Counter
 import functools
+from collections import Counter
 from importlib import metadata
 
 import torch
 
 import cudnn
+from cudnn._causal_conv1d_bulk_arch import is_functional_arch, uses_vec8_schedule
 
 _SUPPORTED_FLA_VERSION = "0.5.2"
 _DECLINE_ERRORS = (ImportError, NotImplementedError, cudnn.cudnnGraphNotSupportedError)
@@ -177,10 +178,6 @@ def _decline_reason(
         return "token-index-limit"
     if channels > _MAX_SCALAR_GRID_CHANNELS:
         return "channel-grid-limit"
-    if channels % 8 and total_tokens * channels > _INT32_MAX:
-        return "scalar-index-limit"
-    if channels % 8 and (initial_state is not None or output_final_state) and batch * channels * 4 > _INT32_MAX:
-        return "state-index-limit"
     reason = _tensor_reason(
         x,
         dtype=torch.bfloat16,
@@ -190,8 +187,14 @@ def _decline_reason(
     )
     if reason is not None:
         return reason
-    if _device_capability(x.device) != (10, 0):
-        return "non-sm100"
+    compute_capability = _device_capability(x.device)
+    if not is_functional_arch(compute_capability):
+        return "unsupported-arch"
+    if not uses_vec8_schedule(compute_capability, channels):
+        if total_tokens * channels > _INT32_MAX:
+            return "scalar-index-limit"
+        if (initial_state is not None or output_final_state) and batch * channels * 4 > _INT32_MAX:
+            return "state-index-limit"
     reason = _tensor_reason(
         weight,
         dtype=torch.bfloat16,
