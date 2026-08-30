@@ -1802,6 +1802,57 @@ def _replace_marker_lines(src: str, replacements: dict[str, str], *, template_ki
     return rendered
 
 
+def _moe_scheduler_claim_replacements(tmpl) -> dict[str, str]:
+    """Render one private MoE scheduler strategy into the shared template.
+
+    Claim-one is the established source, emitted byte-for-byte at the two
+    scheduler markers. Claim-two adds only leader-warp state and amortizes the
+    global atomic; it does not change the scheduler ring protocol. The strategy
+    lives on ``KernelTemplate`` rather than ``TileConfig`` because it is an
+    execution policy over the same tile geometry.
+    """
+    chunk = tmpl.moe_scheduler_claim_chunk
+    if chunk == 1:
+        state = ""
+        claim = "\n".join(
+            (
+                "if lane == 0:",
+                "    claimed = nvvm.atomicrmw(",
+                '        "add",',
+                "        sched_counter_ptr,",
+                "        cutlass.Int32(1),",
+                '        mem_order="relaxed",',
+                '        syncscope="gpu",',
+                "    )",
+            )
+        )
+    elif chunk == 2:
+        # The block-scale MoE template has a two-stage broadcast ring. Reuse
+        # that existing stage as the 0/1 ticket cursor, so the paired strategy
+        # adds no independent offset state or update.
+        state = "claim_ring_base = cutlass.Int32(0)"
+        claim = "\n".join(
+            (
+                "if lane == 0:",
+                "    if bcast_stage == 0:",
+                "        claim_ring_base = nvvm.atomicrmw(",
+                '            "add",',
+                "            sched_counter_ptr,",
+                "            cutlass.Int32(SCHED_BCAST_STAGES),",
+                '            mem_order="relaxed",',
+                '            syncscope="gpu",',
+                "        )",
+                "    claimed = claim_ring_base + bcast_stage",
+            )
+        )
+    else:  # KernelTemplate validates this; keep renderer failure local too.
+        raise ValueError(f"unsupported MoE scheduler claim chunk {chunk}")
+    return {
+        "INJECT_MOE_SCHEDULER_CLAIM_STATE": state,
+        "INJECT_MOE_SCHEDULER_CLAIM": claim,
+    }
+
+
 def _render_template(
     chain: FusionChain,
     snippets: EpilogueSnippets,
@@ -1976,13 +2027,24 @@ def _render_block_scale_template(
     chain: FusionChain,
     snippets: EpilogueSnippets,
     config: TileConfig,
+    *,
+    scheduler_claim_chunk: int = 1,
 ) -> str:
     """Render the block-scale matmul template. Picks TMA-store when
     _use_tma_store_epi allows, else STG; SF TMA descriptors are hardcoded in the
     template (not injected). Epilogue aux/tap markers still work."""
-    from .kernel_registry import select_template
+    from .kernel_registry import select_moe_scheduler_template, select_template
 
-    tmpl = select_template(chain, config)
+    if chain.has_moe:
+        tmpl = select_moe_scheduler_template(
+            chain,
+            config,
+            claim_chunk=scheduler_claim_chunk,
+        )
+    else:
+        if scheduler_claim_chunk != 1:
+            raise ValueError("scheduler_claim_chunk applies only to MoE templates")
+        tmpl = select_template(chain, config)
     template_path = _TEMPLATE_DIR / tmpl.file
     src = template_path.read_text()
     store_modes = _store_modes(chain, config)
@@ -2161,10 +2223,18 @@ def _render_block_scale_template(
                 "INJECT_MOE_HOST_MSFA_PASS": moe_host_msfa_pass,
             }
         )
+    if "@@INJECT_MOE_SCHEDULER_CLAIM@@" in src:
+        replacements.update(_moe_scheduler_claim_replacements(tmpl))
+    elif tmpl.moe_scheduler_claim_chunk != 1:
+        raise RuntimeError(f"template {tmpl.file} has no private MoE scheduler strategy markers")
 
     src = _replace_marker_lines(src, replacements, template_kind="block-scale template")
 
-    tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{_template_stem(tmpl.file)}_{config.geometry_name}{_store_mode_tag(store_modes)}")
+    tag = re.sub(
+        r"[^A-Za-z0-9_]",
+        "_",
+        f"{_template_stem(tmpl.file)}_{config.geometry_name}{_store_mode_tag(store_modes)}{tmpl.strategy_tag}",
+    )
     src = re.sub(r"\b_kernel\(", f"cudnn_frost_{tag}(", src)
     return src
 
@@ -4150,6 +4220,9 @@ class CompiledMoeBlockScaleGemm:
     _desc_slots_per_cta: int = 0
     store_modes: tuple = ()
     use_tma_store: bool = False
+    # Private codegen strategy baked into this launchable. It is deliberately
+    # absent from the graph API and TileConfig geometry.
+    moe_scheduler_claim_chunk: int = 1
     accepts_stream: ClassVar[bool] = True  # stream-aware dispatch (see CompiledFusedGemm)
 
     @property
@@ -4425,19 +4498,13 @@ def _jit_moe_block_scale(
     config: TileConfig,
     *,
     binding: "GemmBinding | None" = None,
+    scheduler_claim_chunk: int = 1,
 ) -> CompiledMoeBlockScaleGemm:
     """JIT path for a MoE grouped block-scale matmul (dequant + moe_grouped).
 
     Block-scale SF machinery + MoE grouped persistent scheduler + per-group A
     TMA descriptor replacement. STG epilogue only."""
-    from .kernel_registry import (
-        GraphType,
-        mma_arch_reject,
-        select_template,
-    )
-
     _precheck_moe_block_scale(chain, config)
-    _tmpl = select_template(chain, config)
     store_modes = _store_modes(chain, config)
     use_tma = "tma" in store_modes
     snippets = generate(
@@ -4447,7 +4514,12 @@ def _jit_moe_block_scale(
         tma_slots=frozenset(i for i, m in enumerate(store_modes) if m == "tma"),
         packed_lanes=_epi_packed_lanes(config),
     )
-    src = _render_block_scale_template(chain, snippets, config)
+    src = _render_block_scale_template(
+        chain,
+        snippets,
+        config,
+        scheduler_claim_chunk=scheduler_claim_chunk,
+    )
     mod = _import_kernel(src)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
     cluster_m, cluster_n = config.cga_size_m, config.cga_size_n
@@ -4464,4 +4536,5 @@ def _jit_moe_block_scale(
         _desc_slots_per_cta=chain.num_a_operands * 2 + len([m for m in store_modes if m == "tma"]),
         store_modes=store_modes,
         use_tma_store=use_tma,
+        moe_scheduler_claim_chunk=scheduler_claim_chunk,
     )

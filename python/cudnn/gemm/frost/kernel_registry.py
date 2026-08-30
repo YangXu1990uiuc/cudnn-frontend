@@ -23,7 +23,7 @@ template-file selection."""
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 from .fusion_ir import BINARY_OPS, UNARY_OPS, FusionChain
@@ -276,6 +276,37 @@ class KernelTemplate:
     smem_fixed_reserve: int = 2048
     supports_mainloop_fusion: bool = False
     supports_multi_gemm: bool = True
+    # How many consecutive global scheduler tickets one MoE cluster reserves
+    # per atomic. This is an execution strategy, not tile geometry. Registry
+    # rows stay at the established one-ticket default; experimental/tuned
+    # variants are ephemeral ``replace`` copies and never enter TEMPLATES.
+    moe_scheduler_claim_chunk: int = 1
+
+    def __post_init__(self) -> None:
+        if self.moe_scheduler_claim_chunk not in (1, 2):
+            raise ValueError("moe_scheduler_claim_chunk must be 1 or 2; " f"got {self.moe_scheduler_claim_chunk}")
+        if self.moe_scheduler_claim_chunk != 1 and self.graph_type is not GraphType.MOE_BLOCK_SCALE:
+            raise ValueError(f"a non-default MoE scheduler strategy currently requires the MoE block-scale template; got graph_type={self.graph_type.value}")
+
+    @property
+    def strategy_tag(self) -> str:
+        """Kernel-symbol suffix for non-default private strategy variants.
+
+        The default is deliberately empty, preserving existing symbols and
+        content-addressed source. A tuned variant gets a distinct symbol even
+        though it reads the same template file and uses the same geometry.
+        """
+        if self.moe_scheduler_claim_chunk == 1:
+            return ""
+        return f"_sched_claim{self.moe_scheduler_claim_chunk}"
+
+    def with_moe_scheduler_claim_chunk(self, claim_chunk: int) -> "KernelTemplate":
+        """Return an unregistered scheduler specialization of this template."""
+        if self.graph_type is not GraphType.MOE_BLOCK_SCALE:
+            raise ValueError(f"MoE scheduler specialization currently requires the MoE block-scale template; got {self.file} ({self.graph_type.value})")
+        if claim_chunk == self.moe_scheduler_claim_chunk:
+            return self
+        return replace(self, moe_scheduler_claim_chunk=claim_chunk)
 
     @property
     def block_scale(self) -> bool:
@@ -570,6 +601,25 @@ def select_template(
             "E.g. mainloop fusion has no block-scale template variant yet."
         )
     raise ValueError(f"ambiguous template match (registry bug): {[t.file for t in matches]}")
+
+
+def select_moe_scheduler_template(
+    chain: FusionChain,
+    config: TileConfig,
+    *,
+    claim_chunk: int = 1,
+) -> KernelTemplate:
+    """Select the unique registered MoE block-scale template, then specialize it.
+
+    Scheduler variants intentionally are *not* registry rows: graph type,
+    pipeline and geometry still select exactly one source template. A host plan
+    or autotuner may choose ``claim_chunk`` privately after that selection
+    without adding a public graph/config axis or making ``select_template``
+    ambiguous. Plain MoE remains claim-one until its sibling template gains the
+    same render markers and validation.
+    """
+    base = select_template(chain, config)
+    return base.with_moe_scheduler_claim_chunk(claim_chunk)
 
 
 def candidates(chain: FusionChain) -> list[tuple[KernelTemplate, TileConfig]]:

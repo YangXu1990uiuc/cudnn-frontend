@@ -448,6 +448,7 @@ def _kernel(
         bcast_empty_phase = cutlass.Int32(1)
         last_bcast_stage = cutlass.Int32(0)
         last_bcast_empty_done_phase = cutlass.Int32(0)
+        # @@INJECT_MOE_SCHEDULER_CLAIM_STATE@@
         linear_idx = cutlass.Int32(0)
         start_linear_idx = cutlass.Int32(0)
         total_tiles = cutlass.Int32(0)
@@ -478,14 +479,7 @@ def _kernel(
                 ):
                     pass
                 claimed = cutlass.Int32(0)
-                if lane == 0:
-                    claimed = nvvm.atomicrmw(
-                        "add",
-                        sched_counter_ptr,
-                        cutlass.Int32(1),
-                        mem_order="relaxed",
-                        syncscope="gpu",
-                    )
+                # @@INJECT_MOE_SCHEDULER_CLAIM@@
                 claimed = nvvm.shfl_sync(full_warp_mask, claimed, 0, shfl_idx_clamp, nvvm.Shfl.IDX)
                 if lane < cluster_size:
                     (nvvm.mapa(sched_bcast_slot.subview(bcast_stage), lane)).store(claimed)

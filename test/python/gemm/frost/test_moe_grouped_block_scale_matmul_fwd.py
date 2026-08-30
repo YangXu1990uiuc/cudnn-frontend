@@ -7,6 +7,9 @@ dequant + group-loop reference. Covers the BxE > E case."""
 
 from __future__ import annotations
 
+import dataclasses
+import inspect
+
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  (installs hook)
 import pytest
@@ -280,7 +283,7 @@ def test_analyzer_offset_dtype_int64() -> None:
     assert chain.has_moe and chain.has_block_scale
 
 
-def _render_moe_block_scale_scheduler(monkeypatch, cfg_name):
+def _render_moe_block_scale_scheduler(monkeypatch, cfg_name, scheduler_claim_chunk=1):
     # Local imports keep this regression independent of the segmented-row
     # quantization tests that also use these rendering helpers.
     from cudnn.gemm.frost import compiler as frost_compiler
@@ -300,7 +303,12 @@ def _render_moe_block_scale_scheduler(monkeypatch, cfg_name):
         tma_slots=tma_slots,
         packed_lanes=frost_compiler._epi_packed_lanes(cfg),
     )
-    return cfg, render_block_scale_template(chain, snippets, cfg)
+    return cfg, render_block_scale_template(
+        chain,
+        snippets,
+        cfg,
+        scheduler_claim_chunk=scheduler_claim_chunk,
+    )
 
 
 @pytest.mark.parametrize(
@@ -329,6 +337,76 @@ def test_moe_block_scale_scheduler_codegen_drains_final_cluster_broadcast(monkey
     # The rendered cluster tuple makes both guards compile-time false for 1x1,
     # so Cute emits no snapshot or drain instructions for singleton clusters.
     assert (expected_cluster_size > 1) == (cfg.cluster_shape != (1, 1, 1))
+
+
+@pytest.mark.parametrize("cfg_name", [_SEGMENTED_ROW_CFG, _SEGMENTED_ROW_CFG_2CTA])
+def test_moe_block_scale_scheduler_private_claim_variant(monkeypatch, cfg_name) -> None:
+    _, default = _render_moe_block_scale_scheduler(monkeypatch, cfg_name)
+    _, explicit_default = _render_moe_block_scale_scheduler(
+        monkeypatch,
+        cfg_name,
+        scheduler_claim_chunk=1,
+    )
+    _, paired = _render_moe_block_scale_scheduler(
+        monkeypatch,
+        cfg_name,
+        scheduler_claim_chunk=2,
+    )
+
+    # No policy selects the experiment by default: the old source and kernel
+    # symbol survive unchanged, including one ticket per global atomic.
+    assert default == explicit_default
+    assert "claim_ring_base = cutlass.Int32(0)" not in default
+    assert "sched_counter_ptr,\n                        cutlass.Int32(1)," in default
+    assert "_sched_claim" not in default
+
+    # The private variant changes only scheduler reservation and receives a
+    # distinct symbol/cache identity; the existing ring still emits one ticket
+    # per loop iteration.
+    assert "claim_ring_base = cutlass.Int32(0)" in paired
+    assert "if bcast_stage == 0:" in paired
+    assert "sched_counter_ptr,\n                            cutlass.Int32(SCHED_BCAST_STAGES)," in paired
+    assert "claimed = claim_ring_base + bcast_stage" in paired
+    assert "claim_offset" not in paired
+    assert "_sched_claim2(" in paired
+    assert paired != default
+
+
+def test_moe_scheduler_variant_is_not_a_registry_or_tile_axis(monkeypatch) -> None:
+    from cudnn.gemm.frost.kernel_registry import (
+        GraphType,
+        TEMPLATES,
+        select_moe_scheduler_template,
+        select_template,
+    )
+    from cudnn.gemm.frost.tile_config import TileConfig
+
+    monkeypatch.setattr(compiler, "_current_arch", lambda device=None: 100)
+    chain = analyze(_build_graph(2, 1024, 256, 512, num_groups=4))
+    cfg = by_name(_SEGMENTED_ROW_CFG)
+    base = select_template(chain, cfg)
+    paired = select_moe_scheduler_template(chain, cfg, claim_chunk=2)
+
+    assert select_moe_scheduler_template(chain, cfg, claim_chunk=1) is base
+    assert base.moe_scheduler_claim_chunk == 1
+    assert paired.moe_scheduler_claim_chunk == 2
+    assert paired.file == base.file
+    assert paired.pipeline == base.pipeline
+    assert paired.graph_type is base.graph_type
+    assert paired.accepts(chain, cfg) is None
+    assert paired not in TEMPLATES
+    assert [t for t in TEMPLATES if t.file == base.file] == [base]
+    assert "moe_scheduler_claim_chunk" not in {field.name for field in dataclasses.fields(TileConfig)}
+    assert "scheduler_claim_chunk" not in inspect.signature(jit_from_cudnn_graph).parameters
+    private_claim = inspect.signature(compiler._jit_moe_block_scale).parameters["scheduler_claim_chunk"]
+    assert private_claim.kind is inspect.Parameter.KEYWORD_ONLY
+    assert private_claim.default == 1
+
+    with pytest.raises(ValueError, match="must be 1 or 2"):
+        select_moe_scheduler_template(chain, cfg, claim_chunk=3)
+    plain_moe = next(t for t in TEMPLATES if t.graph_type is GraphType.MOE)
+    with pytest.raises(ValueError, match="requires the MoE block-scale template"):
+        plain_moe.with_moe_scheduler_claim_chunk(2)
 
 
 def test_analyzer_detects_moe_grouped_block_scale_matmul_fwd_reduction() -> None:
