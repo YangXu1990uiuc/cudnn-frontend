@@ -48,6 +48,7 @@ def _vp_moe(compiled, token, weight, fto, output):
 
 _CFG = "CONFIG_sm100_128x256x128_128x256x32_cluster2x1"
 _SCHED_CFG_1CTA = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+_SCHED_CFG_1CTA_MULTI = "CONFIG_sm100_128x128x128_128x128x32_cluster1x2_1ctamma"
 _SCHED_CFG_2CTA = "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma"
 # (config name, cta_group): 2-CTA cluster2x1 (reference) + 1-CTA cluster1x1.
 _GEOMETRIES = [
@@ -207,8 +208,15 @@ def _build_graph(
     return g
 
 
-@pytest.mark.parametrize("cfg_name,expected_cta_group", [(_SCHED_CFG_1CTA, 1), (_SCHED_CFG_2CTA, 2)])
-def test_moe_scheduler_codegen_drains_final_cluster_broadcast(monkeypatch, cfg_name, expected_cta_group) -> None:
+@pytest.mark.parametrize(
+    "cfg_name,expected_cta_group,expected_cluster_size",
+    [
+        (_SCHED_CFG_1CTA, 1, 1),
+        (_SCHED_CFG_1CTA_MULTI, 1, 2),
+        (_SCHED_CFG_2CTA, 2, 2),
+    ],
+)
+def test_moe_scheduler_codegen_drains_final_cluster_broadcast(monkeypatch, cfg_name, expected_cta_group, expected_cluster_size) -> None:
     chain = analyze(_build_graph(2, 1024, 256, 512, num_groups=4))
     cfg = by_name(cfg_name)
     assert cfg.cta_group == expected_cta_group
@@ -224,12 +232,21 @@ def test_moe_scheduler_codegen_drains_final_cluster_broadcast(monkeypatch, cfg_n
         packed_lanes=compiler._epi_packed_lanes(cfg),
     )
     rendered = _render_template(chain, snippets, cfg)
+    assert cfg.cluster_shape[0] * cfg.cluster_shape[1] * cfg.cluster_shape[2] == expected_cluster_size
+    assert f"cluster_shape_mnk = {cfg.cluster_shape}" in rendered
+    acknowledge = rendered.index("nvvm.mbarrier_arrive(nvvm.mapa(sched_bcast_empty_mbar_ptr.subview(bcast_stage), 0))")
     snapshot = rendered.index("last_bcast_stage = bcast_stage")
+    snapshot_guard = rendered.rfind("if cutlass.const_expr(cluster_size > 1):", 0, snapshot)
     advance = rendered.index("bcast_stage += 1")
+    drain_guard = rendered.rfind("if cutlass.const_expr(cluster_size > 1):", 0, rendered.rindex("sched_bcast_empty_mbar_ptr.subview(last_bcast_stage)"))
+    leader_guard = rendered.rindex("if cta_rank_in_cluster == 0:")
     drain = rendered.rindex("sched_bcast_empty_mbar_ptr.subview(last_bcast_stage)")
-    assert snapshot < advance < drain
+    assert acknowledge < snapshot_guard < snapshot < advance < drain_guard < leader_guard < drain
     assert "last_bcast_empty_done_phase = bcast_empty_phase ^ 1" in rendered
     assert "last_bcast_empty_done_phase," in rendered[drain : drain + 240]
+    # The rendered cluster tuple makes both guards compile-time false for 1x1,
+    # so Cute emits no snapshot or drain instructions for singleton clusters.
+    assert (expected_cluster_size > 1) == (cfg.cluster_shape != (1, 1, 1))
 
 
 # --------------------------------------------------------------------------- #
