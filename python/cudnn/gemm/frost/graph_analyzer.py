@@ -571,6 +571,31 @@ def build_gemm_plan(graph: cudnn.pygraph):
     return jit_from_cudnn_graph(graph, config=config)
 
 
+def _build_gemm_plan(graph: cudnn.pygraph, *, scheduler_claim_chunk: int = 1):
+    """Build an internal scheduler variant without widening the public helper.
+
+    The default delegates to :func:`build_gemm_plan` so ``knobs=None`` keeps
+    exactly the established selection and compilation path.
+    """
+    if scheduler_claim_chunk == 1:
+        return build_gemm_plan(graph)
+    if scheduler_claim_chunk != 2:
+        raise ValueError(f"scheduler_claim_chunk must be 1 or 2; got {scheduler_claim_chunk}")
+    if not _graph_has_gemm(graph):
+        raise ValueError("cudnn.gemm.frost: graph has no matmul / moe_grouped_matmul node; nothing to compile")
+
+    from .compiler import _jit_moe_block_scale_from_cudnn_graph, plan_config
+
+    chain = analyze(graph)
+    if not (chain.has_moe and chain.has_block_scale):
+        raise ValueError("scheduler_claim_chunk=2 requires a MoE block-scale graph; " f"got has_moe={chain.has_moe}, has_block_scale={chain.has_block_scale}")
+    return _jit_moe_block_scale_from_cudnn_graph(
+        graph,
+        plan_config(chain),
+        scheduler_claim_chunk=scheduler_claim_chunk,
+    )
+
+
 # Analyzer
 
 

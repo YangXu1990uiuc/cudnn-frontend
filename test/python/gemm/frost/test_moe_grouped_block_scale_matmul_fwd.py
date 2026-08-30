@@ -8,7 +8,9 @@ dequant + group-loop reference. Covers the BxE > E case."""
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import inspect
+from contextlib import nullcontext
 
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  (installs hook)
@@ -38,7 +40,7 @@ from cudnn.gemm.frost.epilogue_codegen import _f8_128x4_row_scale_index_expr, ge
 from cudnn.gemm.frost.fusion_ir import segmented_row_scale_capacity_rows
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.tile_config import by_name
-from test_matmul import _f8_row_scale_addr
+from test_matmul import _build_graph as _build_plain_matmul_graph, _f8_row_scale_addr
 
 pytestmark = pytest.mark.L0
 
@@ -341,6 +343,9 @@ def test_moe_block_scale_scheduler_codegen_drains_final_cluster_broadcast(monkey
 
 @pytest.mark.parametrize("cfg_name", [_SEGMENTED_ROW_CFG, _SEGMENTED_ROW_CFG_2CTA])
 def test_moe_block_scale_scheduler_private_claim_variant(monkeypatch, cfg_name) -> None:
+    from cudnn.engines.base import PlanConfig
+    from cudnn.gemm.frost.engine import FrostGemmKnobs
+
     _, default = _render_moe_block_scale_scheduler(monkeypatch, cfg_name)
     _, explicit_default = _render_moe_block_scale_scheduler(
         monkeypatch,
@@ -370,6 +375,11 @@ def test_moe_block_scale_scheduler_private_claim_variant(monkeypatch, cfg_name) 
     assert "claim_offset" not in paired
     assert "_sched_claim2(" in paired
     assert paired != default
+    claim1_plan = PlanConfig(91_337, None)
+    claim2_plan = PlanConfig(91_337, FrostGemmKnobs())
+    assert claim1_plan.engine_id == claim2_plan.engine_id
+    assert claim1_plan.knobs != claim2_plan.knobs
+    assert hashlib.sha256(default.encode()).digest() != hashlib.sha256(paired.encode()).digest()
 
 
 def test_moe_scheduler_variant_is_not_a_registry_or_tile_axis(monkeypatch) -> None:
@@ -398,6 +408,9 @@ def test_moe_scheduler_variant_is_not_a_registry_or_tile_axis(monkeypatch) -> No
     assert [t for t in TEMPLATES if t.file == base.file] == [base]
     assert "moe_scheduler_claim_chunk" not in {field.name for field in dataclasses.fields(TileConfig)}
     assert "scheduler_claim_chunk" not in inspect.signature(jit_from_cudnn_graph).parameters
+    from cudnn.gemm.frost import build_gemm_plan
+
+    assert tuple(inspect.signature(build_gemm_plan).parameters) == ("graph",)
     private_claim = inspect.signature(compiler._jit_moe_block_scale).parameters["scheduler_claim_chunk"]
     assert private_claim.kind is inspect.Parameter.KEYWORD_ONLY
     assert private_claim.default == 1
@@ -407,6 +420,84 @@ def test_moe_scheduler_variant_is_not_a_registry_or_tile_axis(monkeypatch) -> No
     plain_moe = next(t for t in TEMPLATES if t.graph_type is GraphType.MOE)
     with pytest.raises(ValueError, match="requires the MoE block-scale template"):
         plain_moe.with_moe_scheduler_claim_chunk(2)
+
+
+def test_frost_gemm_private_plan_knobs_forward_and_keep_one_manifest_slot(
+    monkeypatch,
+) -> None:
+    from cudnn.engines.base import PlanConfig
+    from cudnn.gemm.frost import graph_analyzer as frost_graph_analyzer
+    from cudnn.gemm.frost.engine import FrostGemmEngine, FrostGemmKnobs
+    from cudnn.frost import device as frost_device
+    from cudnn.engines import MANIFEST
+
+    class _Binding:
+        @staticmethod
+        def bound_tensors():
+            return ()
+
+    class _Compiled:
+        binding = _Binding()
+        lowered = None
+
+        def __init__(self, identity):
+            self.identity = identity
+
+    calls = []
+
+    def fake_build(_graph, **kwargs):
+        calls.append(kwargs)
+        return _Compiled(tuple(sorted(kwargs.items())))
+
+    monkeypatch.setattr(frost_graph_analyzer, "_build_gemm_plan", fake_build)
+    monkeypatch.setattr(frost_device, "build_device", lambda _device: nullcontext())
+
+    engine = FrostGemmEngine()
+    engine.engine_id = 91_337
+    entries = (
+        PlanConfig(engine.engine_id, None),
+        PlanConfig(engine.engine_id, FrostGemmKnobs()),
+    )
+    built = [engine.build_plan(object(), entry) for entry in entries]
+
+    assert len({entry.engine_id for entry in entries}) == 1
+    assert len({repr(entry.knobs) for entry in entries}) == 2
+    assert [plan._compiled.identity for plan in built] == [
+        (("scheduler_claim_chunk", 1),),
+        (("scheduler_claim_chunk", 2),),
+    ]
+    assert calls == [dict(identity) for identity in (plan._compiled.identity for plan in built)]
+
+    (family,) = [row for row in MANIFEST if row.name == "frost_gemm"]
+    assert list(family.slots) == ["frost_gemm"]
+    assert family.heuristics is None, "private knobs must not auto-emit a second candidate"
+
+    with pytest.raises(NotImplementedError, match="must be FrostGemmKnobs or None"):
+        engine.build_plan(object(), PlanConfig(engine.engine_id, {"scheduler_claim_chunk": 2}))
+
+
+def test_frost_gemm_claim2_knobs_reject_plain_graph() -> None:
+    from cudnn.engines.base import PlanConfig
+    from cudnn.gemm.frost.engine import FrostGemmEngine, FrostGemmKnobs
+
+    engine = FrostGemmEngine()
+    engine.engine_id = 91_337
+    plain = _build_plain_matmul_graph(128, 128, 128, "bf16", "bf16")
+    with pytest.raises(
+        NotImplementedError,
+        match="scheduler_claim_chunk=2 requires a MoE block-scale graph",
+    ):
+        engine.build_plan(
+            plain,
+            PlanConfig(
+                engine.engine_id,
+                FrostGemmKnobs(),
+            ),
+        )
+    with pytest.raises(ValueError, match="only represents scheduler_claim_chunk=2"):
+        FrostGemmKnobs(scheduler_claim_chunk=1)
+    with pytest.raises(ValueError, match="only represents scheduler_claim_chunk=2"):
+        FrostGemmKnobs(scheduler_claim_chunk=3)
 
 
 def test_analyzer_detects_moe_grouped_block_scale_matmul_fwd_reduction() -> None:

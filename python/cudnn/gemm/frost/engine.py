@@ -10,6 +10,7 @@ coverage to serve graphs unasked. The analysis and codegen are unchanged (``grap
 ``compiler``); this file is only the engine contract around them.
 """
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, List
 
 from cudnn import behavior_note
@@ -18,6 +19,23 @@ from cudnn.frost.workspace import Workspace
 
 if TYPE_CHECKING:
     from cudnn._pygraph import pygraph
+
+
+@dataclass(frozen=True)
+class FrostGemmKnobs:
+    """Private per-plan FROST GEMM tuning request.
+
+    ``None`` remains the engine's established automatic-config / claim-one
+    behavior.  The only explicit value names the experimental claim-two plan;
+    this typed vocabulary is only for deterministic internal plan construction
+    and replay, not a graph or public ``TileConfig`` axis.
+    """
+
+    scheduler_claim_chunk: int = 2
+
+    def __post_init__(self) -> None:
+        if type(self.scheduler_claim_chunk) is not int or self.scheduler_claim_chunk != 2:
+            raise ValueError("FrostGemmKnobs only represents scheduler_claim_chunk=2; " "use knobs=None for the default claim-one plan")
 
 
 class _FrostGemmPlan(CompiledPlan):
@@ -96,8 +114,13 @@ class FrostGemmEngine(BaseEngine):
             raise NotImplementedError(f"frost_gemm: {exc}") from exc
 
     def build_plan(self, graph: "pygraph", plan: PlanConfig, ctx: ExecutionContext = None) -> CompiledPlan:
-        from .graph_analyzer import build_gemm_plan
+        from .graph_analyzer import _build_gemm_plan
         from cudnn.frost.device import build_device
+
+        knobs = plan.knobs if plan is not None else None
+        if knobs is not None and not isinstance(knobs, FrostGemmKnobs):
+            raise NotImplementedError("frost_gemm: plan knobs must be FrostGemmKnobs or None; " f"got {type(knobs).__name__}")
+        scheduler_claim_chunk = knobs.scheduler_claim_chunk if knobs is not None else 1
 
         # Bake the plan for the device of the handle the graph carries (via ctx),
         # not whatever CUDA device is current at build time. A foreign raw-int
@@ -106,7 +129,7 @@ class FrostGemmEngine(BaseEngine):
         device = handle.device.ordinal if hasattr(handle, "device") else None
         try:
             with build_device(device):
-                return _FrostGemmPlan(build_gemm_plan(graph))
+                return _FrostGemmPlan(_build_gemm_plan(graph, scheduler_claim_chunk=scheduler_claim_chunk))
         except (NotImplementedError, ValueError) as exc:
             raise NotImplementedError(f"frost_gemm: {exc}") from exc
 

@@ -3705,6 +3705,38 @@ def jit_from_cudnn_graph(
     )
 
 
+def _jit_moe_block_scale_from_cudnn_graph(
+    graph: cudnn.pygraph,
+    config: TileConfig,
+    *,
+    scheduler_claim_chunk: int,
+) -> "CompiledMoeBlockScaleGemm":
+    """Private engine-plan entrypoint for a MoE scheduler specialization.
+
+    The public :func:`jit_from_cudnn_graph` signature and default route stay
+    unchanged.  This mirrors its graph/config gates before passing the private
+    scheduler strategy to the already-shared MoE block-scale compiler.
+    """
+    if scheduler_claim_chunk not in (1, 2):
+        raise ValueError(f"scheduler_claim_chunk must be 1 or 2; got {scheduler_claim_chunk}")
+    chain, binding = analyze_with_binding(graph)
+    if not (chain.has_moe and chain.has_block_scale):
+        raise ValueError(
+            "a private MoE scheduler strategy requires a MoE block-scale graph; " f"got has_moe={chain.has_moe}, has_block_scale={chain.has_block_scale}"
+        )
+    _dtype_reason = dtype_arch_reject(chain, _current_arch())
+    if _dtype_reason is not None:
+        raise NotImplementedError(_dtype_reason)
+    _check_cta_group_geometry(config)
+    _check_mma_n_dim(chain, config)
+    return _jit_moe_block_scale(
+        chain,
+        config,
+        binding=binding,
+        scheduler_claim_chunk=scheduler_claim_chunk,
+    )
+
+
 # --- sm100_block_scale_matmul: arch/dtype support -------------------------
 # Supported per-side cases live in `kernel_registry.MMA_TYPE_SUPPORT` (single
 # source of truth); this gate delegates to it.
