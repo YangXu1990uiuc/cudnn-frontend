@@ -280,6 +280,35 @@ def test_analyzer_offset_dtype_int64() -> None:
     assert chain.has_moe and chain.has_block_scale
 
 
+def _render_moe_block_scale_scheduler(monkeypatch, cfg_name):
+    chain = analyze(_build_graph(2, 1024, 256, 512, num_groups=4))
+    cfg = by_name(cfg_name)
+    monkeypatch.setattr(compiler, "_current_arch", lambda device=None: 100)
+    monkeypatch.setattr(compiler, "_grid_num_clusters", lambda _cfg, device=None: 1)
+    modes = compiler._store_modes(chain, cfg)
+    tma_slots = frozenset(i for i, mode in enumerate(modes) if mode == "tma")
+    snippets = generate(
+        chain,
+        vec_bytes_epi=compiler._epi_chunk_bytes(chain, cfg, bool(tma_slots)),
+        output_elem_bytes=compiler.DTYPE_BYTES[chain.output_dtype],
+        tma_slots=tma_slots,
+        packed_lanes=compiler._epi_packed_lanes(cfg),
+    )
+    return cfg, _render_block_scale_template(chain, snippets, cfg)
+
+
+@pytest.mark.parametrize("cfg_name,expected_cta_group", [(_SEGMENTED_ROW_CFG, 1), (_SEGMENTED_ROW_CFG_2CTA, 2)])
+def test_moe_block_scale_scheduler_codegen_drains_final_cluster_broadcast(monkeypatch, cfg_name, expected_cta_group) -> None:
+    cfg, rendered = _render_moe_block_scale_scheduler(monkeypatch, cfg_name)
+    assert cfg.cta_group == expected_cta_group
+    snapshot = rendered.index("last_bcast_stage = bcast_stage")
+    advance = rendered.index("bcast_stage += 1")
+    drain = rendered.rindex("sched_bcast_empty_mbar_ptr.subview(last_bcast_stage)")
+    assert snapshot < advance < drain
+    assert "last_bcast_empty_done_phase = bcast_empty_phase ^ 1" in rendered
+    assert "last_bcast_empty_done_phase," in rendered[drain : drain + 240]
+
+
 def test_analyzer_detects_moe_grouped_block_scale_matmul_fwd_reduction() -> None:
     chain = analyze(
         _build_graph(
