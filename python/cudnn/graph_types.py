@@ -292,8 +292,6 @@ def storage_geometry(dim, stride, data_type):
     spells it. Shared by the variant pack (which stores slots) and the engines
     that compare a slot against a declaration.
     """
-    import cudnn
-
     dim = tuple(int(d) for d in dim)
     if stride:
         stride = tuple(int(x) for x in stride)
@@ -303,7 +301,7 @@ def storage_geometry(dim, stride, data_type):
             dense.insert(0, acc)
             acc *= d
         stride = tuple(dense)
-    if data_type != cudnn.data_type.FP4_E2M1:
+    if data_type != _fp4_enum():
         return dim, stride
     # The packed axis is a unit-stride axis with an even extent above one -- a
     # singleton axis may also carry stride 1 and must not be the one picked.
@@ -317,12 +315,24 @@ def storage_geometry(dim, stride, data_type):
     return None
 
 
+_FP4_ENUM = None
+
+
+def _fp4_enum():
+    # cudnn imports this module, so the enum is fetched on first use, once:
+    # storage_geometry runs per overridden operand per execute.
+    global _FP4_ENUM
+    if _FP4_ENUM is None:
+        import cudnn
+
+        _FP4_ENUM = cudnn.data_type.FP4_E2M1
+    return _FP4_ENUM
+
+
 def storage_slot_bytes(data_type) -> "int | None":
     """Bytes per STORAGE slot of a declared dtype: 1 for fp4 (two elements per
     slot), the element width otherwise, None when the width is unknown."""
-    import cudnn
-
-    if data_type == cudnn.data_type.FP4_E2M1:
+    if data_type == _fp4_enum():
         return 1
     from .datatypes import _CUDNN_TO_FROST_DTYPE_NAME
     from .frost.buffers import DTYPE_ITEMSIZE

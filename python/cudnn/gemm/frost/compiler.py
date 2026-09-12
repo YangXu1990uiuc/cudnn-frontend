@@ -4509,19 +4509,28 @@ def _moe_operand_layout_bad(chain, token, weight) -> bool:
     return token.stride(a_unit) != 1 or weight.stride(b_unit) != 1
 
 
-def _kernel_order(buf, t):
+def _declared_storage(t, memo: dict):
+    """``storage_geometry`` of a bound cuDNN tensor, computed once per binding:
+    three pybind reads per operand per call otherwise."""
+    key = id(t)
+    if key not in memo:
+        from cudnn.graph_types import storage_geometry
+
+        try:
+            memo[key] = storage_geometry(t.get_dim(), t.get_stride(), t.get_data_type())
+        except Exception:  # noqa: BLE001 -- an analyzer-synthesized ref has no dims
+            memo[key] = None
+    return memo[key]
+
+
+def _kernel_order(buf, t, memo: "dict | None" = None):
     """A B-side buffer described AS its declaration is in the graph's
     ``[b, k, n]`` axis order (the variant pack lends a bare address, or a buffer
     that disagrees with the declaration, exactly that geometry); the launch
     reads ``(b, n, k)``. The declaration is compared in STORAGE slots -- an fp4
     declaration spells elements, the slot spells x2 pairs -- with the same
     tie-break ``recipe.Operand.axes`` applies on the dense path."""
-    from cudnn.graph_types import storage_geometry
-
-    try:
-        declared = storage_geometry(t.get_dim(), t.get_stride(), t.get_data_type())
-    except Exception:  # noqa: BLE001 -- an analyzer-synthesized ref has no dims
-        return buf
+    declared = _declared_storage(t, {} if memo is None else memo)
     if declared is not None and declared[0] and (tuple(buf.shape), tuple(buf.stride())) == declared:
         return buf.permute(0, 2, 1)
     return buf
@@ -4535,6 +4544,14 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
     if b is None:
         raise NotImplementedError("variant-pack call is not yet wired up for this graph type")
     resolved = resolve_variant_pack(variant_pack, b)
+    # the binding's tensors are fixed, so their declared geometry is too
+    memo = getattr(compiled, "_declared_storage_memo", None)
+    if memo is None:
+        memo = {}
+        try:
+            compiled._declared_storage_memo = memo
+        except AttributeError:  # a compiled object that refuses new attributes: per-call memo
+            pass
 
     def pull(t, role):
         if t is None or id(t) not in resolved:
@@ -4542,12 +4559,12 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
         return resolved[id(t)]
 
     a_bufs = [pull(t, "token") for t in b.a_operands]
-    b_bufs = [_kernel_order(pull(t, "weight"), t) for t in b.b_operands]
+    b_bufs = [_kernel_order(pull(t, "weight"), t, memo) for t in b.b_operands]
     out_bufs = [pull(t, "output") for t in b.outputs]
     aux_bufs = [pull(t, "aux") for t in b.aux]
     fto = pull(b.first_token_offset, "first_token_offset")
     sfa = [pull(t, "SFA") for t in b.sfa_operands]
-    sfb = [_kernel_order(pull(t, "SFB"), t) for t in b.sfb_operands]
+    sfb = [_kernel_order(pull(t, "SFB"), t, memo) for t in b.sfb_operands]
     k_factor = 2 if compiled.chain.matmul.a_dtype == "fp4_e2m1" else 1
     S = a_bufs[0].shape[1]
     K = a_bufs[0].shape[2] * k_factor

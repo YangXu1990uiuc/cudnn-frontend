@@ -68,33 +68,6 @@ def _in_axis_order_of(shape, stride, reference_stride):
     return tuple(shape[a] for a in permutation), tuple(stride[a] for a in permutation)
 
 
-def _span(dim, stride) -> int:
-    """Slots from the base to one past the last addressed slot."""
-    return 1 + sum((int(d) - 1) * int(x) for d, x in zip(dim, stride)) if dim else 1
-
-
-def _numel(dim) -> int:
-    n = 1
-    for d in dim:
-        n *= int(d)
-    return n
-
-
-def _slot_bytes(data) -> "int | None":
-    """Bytes per storage slot of a caller's buffer, or None when it does not say
-    (a bare address; a producer with no dtype width). torch answers through
-    ``element_size()`` (1 for ``float4_e2m1fn_x2``), the array-interface
-    family through ``dtype.itemsize``."""
-    size = getattr(data, "element_size", None)
-    if callable(size):
-        try:
-            return int(size())
-        except Exception:  # noqa: BLE001 -- a producer whose element_size is not a plain int
-            return None
-    itemsize = getattr(getattr(data, "dtype", None), "itemsize", None)
-    return int(itemsize) if isinstance(itemsize, int) and itemsize > 0 else None
-
-
 def cudnn_graph_not_supported(message: str) -> Exception:
     """The classic unsupported-graph error (built lazily: importing cudnn at
     module scope here would be circular)."""
@@ -213,6 +186,7 @@ class pygraph:
         # Backend operand order + the reusable pointer array handed to execute.
         # Both are properties of the frozen graph, so they outlive any one call.
         self._sorted_uids: Optional[List[int]] = None
+        self._declared_layout_native = None  # DeclaredLayout for _sorted_uids; see _declared_layout
         self._selected_engine_cache = None  # (plan config, engine); see selected_engine
 
     # =========================================================================
@@ -2034,36 +2008,9 @@ class pygraph:
         # what a bare address gets -- so an engine reading the pack answers the
         # way the backend does. A buffer with the declared extents but its own
         # strides, a strided view, or one too small for the declaration keeps
-        # its own description; the engine decides.
-        for i, uid in enumerate(order):
-            if i in from_graph or not native.is_filled(i):
-                continue
-            declared = self._tensor_by_uid.get(uid)
-            if declared is None or not declared.dim:
-                continue
-            storage = storage_geometry(declared.dim, declared.stride, declared.data_type)
-            if storage is None:
-                continue
-            own = tuple(native.shape(i)), tuple(native.stride(i))
-            if own == storage:
-                continue
-            if own[0] == storage[0]:
-                # The declared extents under the caller's OWN strides (a padded
-                # or transposed view of this very tensor): those strides carry
-                # information, and an engine that reads the pack honours them.
-                continue
-            if _span(*own) != _numel(own[0]):
-                # Different extents AND gaps or overlaps between the slots: not
-                # one dense run of the declared bytes (a transposed view of a
-                # contiguous block IS one), so not ours to reinterpret.
-                continue
-            # BYTES, not slots: a uint8 view spanning as many slots as a bf16
-            # declaration covers half its bytes. Unknown widths do not qualify.
-            own_bytes, declared_bytes = _slot_bytes(uid_to_data.get(uid)), storage_slot_bytes(declared.data_type)
-            if own_bytes is None or declared_bytes is None or _span(*own) * own_bytes < _span(*storage) * declared_bytes:
-                continue
-            native.override_operand(i, list(storage[0]), list(storage[1]))
-            from_graph.append(i)
+        # its own description; the engine decides. The rule runs natively, one
+        # crossing per pack: this is on every execute's critical path.
+        from_graph.extend(native.describe_from(self._declared_layout(order), from_graph))
         if override_uids:
             # The backend refuses a partial override; a short list must not
             # quietly mean "keep the rest" here.
@@ -2102,6 +2049,25 @@ class pygraph:
             else:
                 workspace_ptr, workspace_bytes = extent
         return VariantPack(tuple(order), native, workspace_ptr, workspace_bytes, tuple(from_graph))
+
+    def _declared_layout(self, order: List[int]):
+        """The storage-slot geometry each slot of ``order`` was declared with,
+        built once per graph: the declaration is fixed once the graph is, and
+        ``storage_geometry`` per operand per execute was a measurable share of
+        the host path. Reset with ``_sorted_uids``."""
+        layout = self._declared_layout_native
+        if layout is None:
+            layout = _pybind_module.DeclaredLayout(len(order))
+            for i, uid in enumerate(order):
+                declared = self._tensor_by_uid.get(uid)
+                if declared is None or not declared.dim:
+                    continue
+                storage = storage_geometry(declared.dim, declared.stride, declared.data_type)
+                if storage is None:
+                    continue
+                layout.set(i, list(storage[0]), list(storage[1]), storage_slot_bytes(declared.data_type) or 0)
+            self._declared_layout_native = layout
+        return layout
 
     def _describe(self, data: Any, uid: int):
         """``(pointer, Tensor)`` for one caller buffer.
@@ -2289,6 +2255,7 @@ class pygraph:
         # The loaded graph carries its own variant_pack, so an order cached while
         # this container held a different graph no longer describes it.
         self._sorted_uids = None
+        self._declared_layout_native = None
 
     def _lower_to_cpp(self) -> Any:
         """Lower Python graph to C++ (the internal ``_pybind_module.backend_graph``)."""

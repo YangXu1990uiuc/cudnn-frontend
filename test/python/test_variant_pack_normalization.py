@@ -223,6 +223,23 @@ def test_a_buffer_that_disagrees_with_the_declaration_is_described_from_it():
 
 
 @pytest.mark.L0
+def test_the_declared_layout_is_built_once_and_the_rule_runs_natively():
+    """The rule is on every execute's critical path (backend plans included),
+    so the declaration side is computed once per graph and the comparison is
+    one crossing per pack: the second execute reuses the first's layout."""
+    g, vp, (a, b, c) = _matmul_graph()
+    A, B, C = vp.keys()
+    ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+    assert g._declared_layout_native is None
+    first = g._normalize(g._uid_to_data({A: a.view(M, K), B: b.view(K, N), C: c}), ws)
+    layout = g._declared_layout_native
+    assert layout is not None and len(layout) == len(first)
+    second = g._normalize(g._uid_to_data({A: a, B: b, C: c}), ws)
+    assert g._declared_layout_native is layout
+    assert set(first.graph_described) == {first.index_of(A), first.index_of(B)} and second.graph_described == ()
+
+
+@pytest.mark.L0
 def test_the_declared_extents_under_the_callers_own_strides_are_kept():
     """A padded / transposed view of the declared tensor: the strides carry
     information and the engine honours them (the linear-attention engines

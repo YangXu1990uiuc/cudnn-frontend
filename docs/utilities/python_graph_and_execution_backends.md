@@ -150,6 +150,16 @@ declared bytes and meets the engine's alignment. Rules that follow:
   shape the plan was built for; read the pack for the shape this call runs**
   (`frost_gemm` reads its M/N/K there, so one plan serves many problem sizes).
 
+The rule is on every execute's critical path, backend plans included, so the
+declaration side (`storage_geometry` of every slot) is computed once per graph
+into a native `DeclaredLayout` and the comparison runs in one crossing per pack
+(`VariantPackNative.describe_from`). Measured at 128×256×128 bf16, host enqueue
+per execute on SM100: backend plan 11.7 → 12.0 µs, `frost_gemm` 21.9 → 22.0 µs,
+and a FlashInfer-shaped 2-D binding costs what a declared one does (12.1). The
+first, per-operand Python form of the same rule was +7.5 µs on both paths and
++10 µs more for the 2-D binding — two crossings and a `storage_geometry` per
+operand per call.
+
 Two rules that are easy to break by accident:
 
 - **The pointer array is per call.** Two threads may execute one graph
