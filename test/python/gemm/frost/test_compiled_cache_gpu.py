@@ -12,6 +12,8 @@ import sys
 
 import pytest
 
+from cudnn.frost import compiled_cache as cc
+
 from gemm_test_utils import requires_sm100
 
 pytestmark = [pytest.mark.L0, requires_sm100]
@@ -50,11 +52,11 @@ def test_second_process_reloads_the_exported_kernel(tmp_path):
     first = _run(tmp_path)
     assert first["stats"]["misses"] >= 1 and first["stats"]["hits"] == 0, first
     assert first["reloaded"], "the miss path hands back the reloaded artifact so hit and miss run the same thing"
-    entries = list((tmp_path / "v1").glob("*/*/entry.json"))
+    entries = list((tmp_path / cc._SCHEMA).glob("*/*/entry.json"))
     assert entries, "no entry committed"
     record = json.loads(entries[0].read_text())
-    assert record["schema"] == "v1" and record["symbol"] == "frost_gemm" and (entries[0].parent / "kernel.o").stat().st_size > 0
-    assert json.loads((entries[0].parent.parent / "manifest.json").read_text())["schema"] == "v1"
+    assert record["schema"] == cc._SCHEMA and record["symbol"] == "frost_gemm" and (entries[0].parent / "kernel.o").stat().st_size > 0
+    assert json.loads((entries[0].parent.parent / "manifest.json").read_text())["schema"] == cc._SCHEMA
 
     second = _run(tmp_path)
     assert second["stats"]["misses"] == 0 and second["stats"]["hits"] >= 1, second

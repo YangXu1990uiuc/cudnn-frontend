@@ -13,6 +13,7 @@ device setup kernel builds ragged metadata and runtime O/K/V tensor maps; the
 main launch uses a persistent grid and dynamic packed extents.
 """
 
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 from functools import lru_cache
 from typing import Callable, Optional, Tuple
 
@@ -3402,6 +3403,7 @@ def compile(  # noqa: A001
     lse_stride: Optional[tuple[int, int, int]] = None,
 ) -> Callable:
     """Compile the exact D256 MXFP8 kernel and its per-tile SF views."""
+    _cache_key = _template_key(globals(), locals(), "compile")
     if SPLIT_KV > 1 and not has_lse:
         raise ValueError("split_kv > 1 requires has_lse=True (the per-split LSE drives the combine)")
     if lse_stride is not None and SPLIT_KV > 1:
@@ -3509,7 +3511,7 @@ def compile(  # noqa: A001
         fake_thd_kv_lens = None
         fake_thd_lens_form = None
 
-    return cute.compile(
+    return _compile_cached(
         _host,
         fake_q,
         fake_k,
@@ -3533,6 +3535,8 @@ def compile(  # noqa: A001
         *((fake_o,) if _FP32_PARTIALS else ()),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
+        cache_key=_cache_key,
+        symbol="frost_sdpa_fwd",
     )
 
 

@@ -691,9 +691,20 @@ DSL's own file cache stores only MLIR bytecode, so a process that warms tens
 of plans pays minutes at start-up. `cudnn.frost.compiled_cache` keeps the
 exported tvm-ffi object of every kernel compiled with `--enable-tvm-ffi` and
 reloads it in milliseconds. `compile_cached(fn, *args, cache_key=, symbol=,
-**kwargs)` is the drop-in for `cute.compile` at a kernel's compile site; the
-FROST GEMM templates route through it with the digest of their generated
-source as the key (44 kernels of the GEMM suites: 44 s cold, 12 s warm).
+**kwargs)` is the drop-in for `cute.compile` at a kernel's compile site. Every FROST kernel template
+routes through it: the GEMM templates with the digest of their generated
+source as the key (the full GEMM suites: 5655 tests, 20:53 cold, 1:35 warm),
+the SDPA forward / backward and linear-attention templates with
+`template_key(globals(), locals(), "<function>")` as the FIRST statement of
+each function that compiles — the file + params digest `template_loader`
+records as `FROST_SOURCE_DIGEST`, joined with the function's name and its
+arguments, which pin shapes, strides and flags the way the params pin dtypes
+and masks (SDPA SM100 graph-API cases: 24.8 s cold, 2.4 s warm). An argument
+that is not a plain value (a tensor, a device, a dtype object) makes the key
+None and the call compiles as before: the linear-attention `chunk_*`
+launchers, which trace real tensors, and the SDPA adapters' helper kernels in
+`api_dsl` are therefore not cached yet. A hit is the same object a miss
+produced, so the reloaded kernel is called exactly as the in-process one.
 
 The rules, borrowed from FlashInfer's autotune cache v2 so that a stale
 artifact can never be reused by accident:
@@ -711,19 +722,26 @@ artifact can never be reused by accident:
 - **Anything doubtful is a miss**: missing, malformed, mismatched, or an
   object `load_module` refuses (an arch the device cannot run). Never an error.
 - **A hit and a miss run the same thing.** A reloaded tvm-ffi function is
-  positional-only, so it is wrapped with a kwargs wrapper built from the
-  kernel's Python signature; the miss path exports and then reloads, so a bad
-  artifact fails at build time, not at the next start-up. Kernels whose
-  in-process object converts raw pointer arguments are not cached.
+  positional-only, so it is wrapped with the kwargs wrapper the DSL itself
+  uses, rebuilt from the RUNTIME spec the record carries (`arg_names`,
+  defaults, keyword-only names) — the Python signature minus
+  `cutlass.Constexpr` and env-stream parameters, which do not exist at run
+  time. A wrapper built from the Python signature would shift every argument
+  after a constexpr one (the fp8 SDPA kernels have one). The miss path
+  exports and then reloads, so a bad artifact fails at build time, not at the
+  next start-up. Kernels whose in-process object converts raw pointer
+  arguments, takes a dataclass argument, or has a default JSON cannot carry
+  are not persisted.
 - Location: `CUDNN_FRONTEND_COMPILED_CACHE`, else
   `$XDG_CACHE_HOME/cudnn_frontend/compiled_plans`; `set_cache_dir()` for a
   caller that owns a workspace (FlashInfer); `CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1`
   turns it off; `stats()` reports hits / misses / bypassed / invalid per
   process. Bump `_SCHEMA` on any incompatible change.
 
-Not yet routed: the SDPA and linear-attention kernel templates (their
-`cute.compile` calls take per-kernel keyword sets; same hook, one key per
-`(template, params, kwargs)`).
+Not yet routed: kernels compiled from real tensors at call time (the
+linear-attention `chunk_*` launchers, the SDPA adapters' `_dot_fn` /
+`_reduce_fn` / `_setup_fn` helpers): a key for them has to spell the traced
+tensors' dtype, rank and dynamic marks; same hook once it does.
 
 ## Key invariants
 

@@ -48,6 +48,7 @@ it once per process.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import inspect
 import json
@@ -59,7 +60,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
-_SCHEMA = "v1"
+_SCHEMA = "v2"  # v2: the record carries the runtime wrapper spec, not a Python signature
 _ENV_DIR = "CUDNN_FRONTEND_COMPILED_CACHE"
 _ENV_DISABLE = "CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"
 _OBJECT = "kernel.o"
@@ -224,19 +225,95 @@ def _read_json(path: Path) -> Any:
         return None
 
 
-def _signature_of(fn: Callable) -> Optional[inspect.Signature]:
-    """The Python signature the in-process kwargs wrapper was built from."""
-    for candidate in (fn, getattr(fn, "__wrapped__", None), getattr(fn, "func", None), getattr(fn, "_func", None)):
-        if candidate is None:
-            continue
-        try:
-            sig = inspect.signature(candidate)
-        except (TypeError, ValueError):
-            continue
-        if any(p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD) for p in sig.parameters.values()):
-            return None
-        return sig
-    return None
+_PLAIN = (int, float, bool, str, type(None))
+
+
+def _plain(value: Any) -> bool:
+    """Whether ``repr(value)`` names the same thing in another process: plain
+    scalars, tuples/lists of them, dataclass instances whose fields are (a
+    template's params record travels into compile() this way), and types
+    (``cutlass.BFloat16`` and friends; a class repr is its qualified name)."""
+    if isinstance(value, _PLAIN) or isinstance(value, type):
+        return True
+    if isinstance(value, (tuple, list)):
+        return all(_plain(v) for v in value)
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return all(_plain(getattr(value, f.name)) for f in dataclasses.fields(value))
+    return False
+
+
+def template_key(module_globals: Dict[str, Any], arguments: Dict[str, Any], function: str = "compile") -> Optional[str]:
+    """The cache key of one ``compile()`` call of a kernel template.
+
+    A template specializes twice: at import, from the file and its
+    ``FROST_TEMPLATE_PARAMS`` (``template_loader`` records that as
+    ``FROST_SOURCE_DIGEST``), and at ``compile()``, from the call's arguments
+    (shapes, strides, flags), which pin the traced code as much as the params
+    do. The key joins the two. Call it as the FIRST statement of the function,
+    with ``locals()``, so the arguments are exactly the parameters. None -- not
+    cacheable -- when the module carries no digest or an argument is not a
+    plain value (a tensor, a device, a stream): its ``repr`` need not name the
+    same kernel in another process.
+    """
+    digest = module_globals.get("FROST_SOURCE_DIGEST")
+    if not digest:
+        return None
+    items = sorted(arguments.items())
+    if not all(_plain(v) for _, v in items):
+        return None
+    return f"{digest}|{function}|{items!r}"
+
+
+def _json_plain(value: Any) -> bool:
+    return value is None or isinstance(value, (bool, int, float, str))
+
+
+def _wrapper_spec_of(compiled: Any, args: tuple, kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The calling convention of the in-process object, as JSON.
+
+    The DSL calls a kernel through a kwargs wrapper generated from its
+    ORIGINAL signature minus the parameters that do not exist at run time:
+    ``cutlass.Constexpr`` arguments are baked into the kernel and an
+    env-stream argument is read from the environment. A wrapper built from the
+    Python signature instead would shift every argument after a constexpr one.
+    So the spec is taken the way the DSL takes it: ``execution_args`` names the
+    parameters and their defaults; the in-process wrapper's own signature says
+    which of them survived. None when it cannot be reproduced exactly -- no
+    wrapper, a default that JSON cannot carry, a dataclass argument (the DSL
+    unpacks those through a hook the record does not describe).
+    """
+    wrapper = getattr(compiled, "_kwargs_wrapper", None)
+    execution_args = getattr(compiled, "execution_args", None)
+    if wrapper is None or execution_args is None or not hasattr(execution_args, "get_kwargs_wrapper_spec"):
+        return None
+    if any(dataclasses.is_dataclass(a) and not isinstance(a, type) for a in list(args) + list(kwargs.values())):
+        return None
+    try:
+        survived = set(inspect.signature(wrapper).parameters)
+        full = execution_args.get_kwargs_wrapper_spec(())
+        excluded = [n for n in list(full.arg_names) + list(full.kwonly_names) if n not in survived]
+        spec = execution_args.get_kwargs_wrapper_spec(excluded) if excluded else full
+    except Exception:  # noqa: BLE001 -- a DSL whose executor does not expose the spec
+        return None
+    arg_defaults, kwonly_defaults = list(spec.arg_defaults), dict(spec.kwonly_defaults)
+    if not all(_json_plain(v) for v in arg_defaults + list(kwonly_defaults.values())):
+        return None
+    return {"arg_names": list(spec.arg_names), "arg_defaults": arg_defaults, "kwonly_names": list(spec.kwonly_names), "kwonly_defaults": kwonly_defaults}
+
+
+def _rebuild_wrapper(raw: Callable, spec: Dict[str, Any]) -> Optional[Callable]:
+    """The kwargs wrapper the in-process object had, over the reloaded function."""
+    from tvm_ffi.utils.kwargs_wrapper import make_kwargs_wrapper
+
+    if not isinstance(spec, dict) or not all(k in spec for k in ("arg_names", "arg_defaults", "kwonly_names", "kwonly_defaults")):
+        return None
+    return make_kwargs_wrapper(
+        raw,
+        arg_names=list(spec["arg_names"]),
+        arg_defaults=tuple(spec["arg_defaults"]),
+        kwonly_names=list(spec["kwonly_names"]),
+        kwonly_defaults=dict(spec["kwonly_defaults"]),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -244,8 +321,9 @@ def _signature_of(fn: Callable) -> Optional[inspect.Signature]:
 # ---------------------------------------------------------------------------
 
 
-def _try_load(entry: Path, key: str, symbol: str, fn: Callable):
-    """The reloaded, kwargs-wrapped kernel, or None (missing, mismatched, unloadable)."""
+def _try_load(entry: Path, key: str, symbol: str):
+    """The reloaded kernel behind the in-process calling convention, or None
+    (missing, mismatched, unloadable)."""
     record = _read_json(entry / _ENTRY)
     if not isinstance(record, dict):
         return None
@@ -256,18 +334,17 @@ def _try_load(entry: Path, key: str, symbol: str, fn: Callable):
     obj = entry / _OBJECT
     if not obj.is_file():
         return None
-    sig = _signature_of(fn)
-    if sig is None:
-        return None
     try:
         import cutlass
-        from tvm_ffi.utils.kwargs_wrapper import make_kwargs_wrapper_from_signature
 
         module = cutlass.runtime.load_module(str(obj), enable_tvm_ffi=True)
         raw = getattr(module, symbol)
-        wrapper = make_kwargs_wrapper_from_signature(raw, sig)
+        wrapper = _rebuild_wrapper(raw, record.get("wrapper"))
+        if wrapper is None:
+            return None
         wrapper._compiled_cache_module = module  # keep the engine alive as long as the callable
         wrapper._compiled_cache_entry = str(entry)
+        wrapper._compiled_cache_raw = raw  # positional-only tvm_ffi.Function, for a prepared lane
         return wrapper
     except Exception as exc:  # noqa: BLE001 -- a stale or foreign artifact is a miss
         _count("invalid")
@@ -275,26 +352,23 @@ def _try_load(entry: Path, key: str, symbol: str, fn: Callable):
         return None
 
 
-def _export(entry: Path, compiled: Any, key: str, symbol: str, manifest: Dict[str, str], fn: Callable) -> None:
-    env_dir = entry.parent
-    if not (env_dir / _MANIFEST).exists():
-        _write_atomic(env_dir / _MANIFEST, (_canonical(manifest) + "\n").encode("utf-8"))
+def _export(entry: Path, compiled: Any, key: str, symbol: str, manifest: Dict[str, str], wrapper: Dict[str, Any]) -> None:
+    """Publish ``compiled`` under ``entry``: object first, record last (the commit marker)."""
     entry.mkdir(parents=True, exist_ok=True)
-    # Unique per export, not per process: two threads may export the same
-    # entry concurrently (nothing serializes compiles), and a shared temp name
-    # would let one publish the other's half-written object.
-    tmp = entry / f".{_OBJECT}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}.tmp"
+    manifest_path = entry.parent / _MANIFEST
+    if not manifest_path.exists():
+        _write_atomic(manifest_path, json.dumps(manifest, indent=1, sort_keys=True).encode("utf-8"))
+    # export_to_c writes the file itself, so it gets a unique temp name and is
+    # renamed into place; a reader sees the whole object or nothing.
+    tmp = entry / f"{_OBJECT}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
     try:
         compiled.export_to_c(str(tmp), function_name=symbol)
         os.replace(tmp, entry / _OBJECT)
     finally:
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
-    sig = _signature_of(fn)
-    record = {"schema": _SCHEMA, "key": key, "symbol": symbol, "signature": str(sig) if sig is not None else None}
-    _write_atomic(entry / _ENTRY, (json.dumps(record, indent=1) + "\n").encode("utf-8"))
+        if tmp.exists():
+            tmp.unlink()
+    record = {"schema": _SCHEMA, "key": key, "symbol": symbol, "wrapper": wrapper}
+    _write_atomic(entry / _ENTRY, json.dumps(record, indent=1, sort_keys=True).encode("utf-8"))
 
 
 def compile_cached(fn: Callable, *args: Any, cache_key: Optional[str], symbol: str = "kernel", **kwargs: Any) -> Any:
@@ -318,7 +392,7 @@ def compile_cached(fn: Callable, *args: Any, cache_key: Optional[str], symbol: s
         _count("bypassed")
         return cute.compile(fn, *args, **kwargs)
     entry = _entry_dir(get_cache_dir(), manifest, f"{cache_key}|{symbol}|{options}")
-    loaded = _try_load(entry, cache_key, symbol, fn)
+    loaded = _try_load(entry, cache_key, symbol)
     if loaded is not None:
         _count("hits")
         return loaded
@@ -327,15 +401,16 @@ def compile_cached(fn: Callable, *args: Any, cache_key: Optional[str], symbol: s
     execution_args = getattr(compiled, "execution_args", None)
     if getattr(execution_args, "has_pointer_address_arg_specs", False) or not hasattr(compiled, "export_to_c"):
         return compiled  # the in-process object converts raw pointers; a reloaded one could not
-    if _signature_of(fn) is None:
-        return compiled
+    wrapper = _wrapper_spec_of(compiled, args, kwargs)
+    if wrapper is None:
+        return compiled  # a calling convention the record cannot reproduce exactly
     try:
-        _export(entry, compiled, cache_key, symbol, manifest, fn)
+        _export(entry, compiled, cache_key, symbol, manifest, wrapper)
     except Exception as exc:  # noqa: BLE001 -- persistence is best-effort; the kernel is compiled either way
         _count("export_failed")
         _LOG.warning("compiled-plan cache: could not persist %s (%s); the kernel will be recompiled next process", entry, exc)
         return compiled
     # Hand back the artifact rather than the in-process object, so a hit and a
     # miss run the same thing and a bad artifact fails here, not next start-up.
-    loaded = _try_load(entry, cache_key, symbol, fn)
+    loaded = _try_load(entry, cache_key, symbol)
     return loaded if loaded is not None else compiled

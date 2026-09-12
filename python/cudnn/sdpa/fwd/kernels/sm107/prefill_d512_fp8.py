@@ -62,6 +62,7 @@ DSL-only adjustments applied (per the C++-to-DSL porting notes):
     wrap; pass raw vec to store_swizzled / slice via vec_slice on Float32.
 """
 
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 import os
 import sys
 from functools import lru_cache
@@ -2623,6 +2624,7 @@ def compile(  # noqa: A001
     # it cannot honor RAISES rather than being silently ignored: a raise here
     # means the engine's Capabilities row is lying, which is the failure we
     # want loud.  (Capabilities: lse_optional=False, no strided Stats.)
+    _cache_key = _template_key(globals(), locals(), "compile")
     if lse_stride is not None:
         raise NotImplementedError(f"{__name__}: strided Stats not ported (contiguous [B, H, S] only)")
     if d_qk > CFG.TILE_K or d_v > CFG.TILE_O or d_qk <= 0 or d_v <= 0:
@@ -2731,7 +2733,7 @@ def compile(  # noqa: A001
         fake_thd_lens_form = cutlass.Int32(0)
     else:
         fake_thd_q_lens = fake_thd_kv_lens = fake_thd_lens_form = None
-    return cute.compile(
+    return _compile_cached(
         _host,
         fake_q,
         fake_k,
@@ -2759,4 +2761,6 @@ def compile(  # noqa: A001
         None,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
+        cache_key=_cache_key,
+        symbol="frost_sdpa_fwd",
     )

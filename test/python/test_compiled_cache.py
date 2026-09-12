@@ -78,20 +78,98 @@ def test_a_foreign_or_corrupt_entry_is_a_miss(tmp_path):
     entry.mkdir()
     (entry / cc._OBJECT).write_bytes(b"not an object")
     (entry / cc._ENTRY).write_text(json.dumps({"schema": cc._SCHEMA, "key": "other", "symbol": "frost_gemm"}))
-    assert cc._try_load(entry, "mine", "frost_gemm", lambda x: x) is None  # embedded key differs
+    assert cc._try_load(entry, "mine", "frost_gemm") is None  # embedded key differs
     (entry / cc._ENTRY).write_text("{not json")
-    assert cc._try_load(entry, "mine", "frost_gemm", lambda x: x) is None  # unreadable record
+    assert cc._try_load(entry, "mine", "frost_gemm") is None  # unreadable record
     (entry / cc._ENTRY).unlink()
-    assert cc._try_load(entry, "mine", "frost_gemm", lambda x: x) is None  # no record at all
+    assert cc._try_load(entry, "mine", "frost_gemm") is None  # no record at all
     assert cc.stats()["invalid"] == 1  # only the key mismatch is worth a warning; the others are plain misses
 
 
-def test_signature_of_rejects_varargs():
-    def ok(a, b, *, stream=None):
+def test_the_record_carries_the_in_process_calling_convention():
+    """A kernel's runtime signature is its Python signature MINUS constexpr and
+    env-stream parameters; the record must say what the DSL's wrapper said."""
+    import inspect
+    from collections import namedtuple
+
+    Spec = namedtuple("Spec", "arg_names arg_defaults kwonly_names kwonly_defaults")
+
+    class ExecutionArgs:  # what jit_executor exposes
+        def get_kwargs_wrapper_spec(self, exclude=()):
+            names = [n for n in ("q", "flag", "count", "tail") if n not in exclude]
+            defaults = {"count": 0, "tail": None}
+            return Spec(names, tuple(defaults[n] for n in names if n in defaults), [n for n in ("stream",) if n not in exclude], {})
+
+    def in_process_wrapper(q, count=0, tail=None, *, stream):  # 'flag' was a Constexpr: gone at run time
         return None
 
-    def bad(*args, **kwargs):
-        return None
+    class Compiled:
+        execution_args = ExecutionArgs()
+        _kwargs_wrapper = staticmethod(in_process_wrapper)
 
-    assert [p for p in cc._signature_of(ok).parameters] == ["a", "b", "stream"]
-    assert cc._signature_of(bad) is None
+    spec = cc._wrapper_spec_of(Compiled(), (1, True, 0, None), {})
+    assert spec == {"arg_names": ["q", "count", "tail"], "arg_defaults": [0, None], "kwonly_names": ["stream"], "kwonly_defaults": {}}
+    calls = []
+    rebuilt = cc._rebuild_wrapper(lambda *a: calls.append(a), spec)
+    rebuilt("Q", stream="S")
+    rebuilt("Q", 7, tail="T", stream="S")
+    assert calls == [("Q", 0, None, "S"), ("Q", 7, "T", "S")]  # defaults filled, kwargs placed, positional-only underneath
+    assert list(inspect.signature(rebuilt).parameters) == ["q", "count", "tail", "stream"]
+
+    # not reproducible exactly -> no record
+    class NoWrapper:
+        execution_args = ExecutionArgs()
+
+    assert cc._wrapper_spec_of(NoWrapper(), (), {}) is None
+    from dataclasses import dataclass
+
+    @dataclass
+    class Op:
+        k: int = 1
+
+    assert cc._wrapper_spec_of(Compiled(), (Op(),), {}) is None  # a dataclass argument goes through a hook the record cannot describe
+    assert cc._rebuild_wrapper(lambda *a: None, None) is None  # an entry from before the record carried a spec is a miss
+
+
+def test_template_key_joins_the_digest_with_plain_arguments_only():
+    g = {"FROST_SOURCE_DIGEST": "abc123"}
+    key = cc.template_key(g, {"b": 2, "qh": 8, "lse_stride": (1, 2, 3), "flag": True, "opt": None}, "compile")
+    assert key.startswith("abc123|compile|") and "('b', 2)" in key and "('lse_stride', (1, 2, 3))" in key
+    assert cc.template_key(g, {"qh": 8, "b": 2}, "compile") == cc.template_key(g, {"b": 2, "qh": 8}, "compile")  # order-free
+    assert cc.template_key(g, {"b": 2}, "compile") != cc.template_key(g, {"b": 2}, "other")  # the function is named
+    assert cc.template_key({}, {"b": 2}) is None  # no digest: the loader did not produce this module
+    assert cc.template_key(g, {"b": 2, "device": object()}) is None  # a repr that need not survive a process
+
+    from dataclasses import dataclass
+
+    @dataclass(frozen=True)
+    class P:
+        d: int = 128
+        thd: bool = False
+
+    assert "P(d=128, thd=False)" in cc.template_key(g, {"p": P()}, "compile")  # a params record of plain fields is plain
+    assert cc.template_key(g, {"p": P(d=object())}, "compile") is None  # unless one of its fields is not
+    import cutlass
+
+    assert "cutlass" in cc.template_key(g, {"io_dtype": cutlass.BFloat16}, "compile")  # a dtype CLASS names itself
+
+
+def test_the_loader_digests_the_file_and_the_params(tmp_path):
+    from dataclasses import dataclass
+
+    from cudnn.frost import template_loader
+
+    @dataclass(frozen=True)
+    class Params:
+        causal: bool = False
+
+    src = tmp_path / "tiny_template.py"
+    src.write_text("CFG = FROST_TEMPLATE_PARAMS\n")
+    a = template_loader.load_template(str(src), Params(False), tag="tiny")
+    b = template_loader.load_template(str(src), Params(True), tag="tiny")
+    assert a.FROST_SOURCE_DIGEST and len(a.FROST_SOURCE_DIGEST) == 16
+    assert a.FROST_SOURCE_DIGEST != b.FROST_SOURCE_DIGEST  # the params are part of it
+    assert template_loader.load_template(str(src), Params(False), tag="tiny") is a  # the module cache still keys on (path, params)
+    src.write_text("CFG = FROST_TEMPLATE_PARAMS  # edited\n")
+    c = template_loader.load_template(str(src), Params(None), tag="tiny")  # a new params value forces a re-read
+    assert c.FROST_SOURCE_DIGEST not in (a.FROST_SOURCE_DIGEST, b.FROST_SOURCE_DIGEST)

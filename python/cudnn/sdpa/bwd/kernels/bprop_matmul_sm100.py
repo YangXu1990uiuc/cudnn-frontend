@@ -43,6 +43,7 @@ without making the same change upstream.
 
 from __future__ import annotations
 
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 from functools import lru_cache
 from typing import Callable
 
@@ -1887,6 +1888,7 @@ _CODEGEN_TARGET_SMS = frozenset({100, 103, 107, 110})
 
 @lru_cache(maxsize=None)
 def compile(device) -> Callable:
+    _cache_key = _template_key(globals(), locals(), "compile")
     major, minor = compute_capability(resolve_device(device))
     sm = major * 10 + minor
     # This is the source-level CODEGEN domain, not the engine's advertised
@@ -1995,7 +1997,7 @@ def compile(device) -> Callable:
     # serves every sequence count either way.
     fake_meta = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int64(),), stride_order=(0,), assumed_align=16)
     fake_desc = make_fake_compact_tensor(cutlass.Int64, (cute.sym_int64(),), stride_order=(0,), assumed_align=16)
-    return cute.compile(
+    return _compile_cached(
         _host,
         problem_size,
         fake_a_0,
@@ -2005,6 +2007,8 @@ def compile(device) -> Callable:
         fake_desc,
         stream=_fake_stream,
         options=f"--enable-tvm-ffi --gpu-arch {gpu_arch}",
+        cache_key=_cache_key,
+        symbol="frost_sdpa_bwd",
     )
 
 
