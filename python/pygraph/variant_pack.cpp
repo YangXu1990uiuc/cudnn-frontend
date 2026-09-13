@@ -130,6 +130,8 @@ dtype_name(DLDataType dtype) {
         return "float8_e5m2";
     } else if (code == kDLFloat8_e8m0fnu) {
         return "float8_e8m0fnu";
+    } else if (code == kDLFloat4_e2m1fn && bits == 4) {
+        return "float4_e2m1fn_x2";  // two elements per slot, as torch spells the storage dtype
     }
     return "code" + std::to_string(code) + "_" + std::to_string(bits);
 }
@@ -300,9 +302,10 @@ class OperandBuffer {
         return dtype_name(operand_.dtype);
     }
 
+    // Bytes per storage slot: an fp4 slot is 4 bits x 2 lanes = one byte.
     int64_t
     element_size() const {
-        return operand_.dtype.bits / 8;
+        return (static_cast<int64_t>(operand_.dtype.bits) * operand_.dtype.lanes + 7) / 8;
     }
 
     int64_t

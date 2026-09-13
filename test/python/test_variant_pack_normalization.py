@@ -309,6 +309,8 @@ def test_a_buffer_of_the_declared_width_is_read_as_the_declared_dtype():
     assert list(pack.shape(0)) == [1, M, K // 2] and pack.dtype(0) == (17, 4)
     assert list(pack.shape(1)) == [1, M, K // 2] and pack.dtype(1) == (17, 4)  # dtype reinterpreted even when the extents already matched
     assert list(pack.shape(2)) == [1, M, N] and pack.dtype(2) == bf16_dl[:2]  # the blob became the declared output
+    slot = pack.operand(0, 0)  # what an engine is handed: one byte per fp4 x2 slot, spelled as torch spells it
+    assert slot.dtype == "float4_e2m1fn_x2" and slot.element_size() == 1 and slot.nbytes == M * K // 2
     assert list(pack.shape(3)) == [1, M, N] and pack.dtype(3) == (1, 8)  # too small: its own dtype and description stand
     x2 = getattr(torch, "float4_e2m1fn_x2", None)
     if x2 is not None:  # torch's own spelling arrives as the same dtype and is left alone
