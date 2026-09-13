@@ -33,7 +33,7 @@ from ._handle import Handle, to_backend_handle
 from .datatypes import _buffer_dtype_to_cudnn, _dlpack_code_bits, _torch_to_cudnn_data_type
 from .engines.base import ExecutionContext, VariantPack
 from .engines.engine_ids import is_python_engine
-from .graph_types import NodeType, Tensor, byte_size as _byte_size, describing_tensor
+from .graph_types import NodeType, Tensor, byte_size as _byte_size, describing_tensor, storage_geometry, storage_slot_bytes
 from .nodes import Node, _row_major_stride
 
 _LOG = logging.getLogger("cudnn.pygraph")
@@ -186,6 +186,7 @@ class pygraph:
         # Backend operand order + the reusable pointer array handed to execute.
         # Both are properties of the frozen graph, so they outlive any one call.
         self._sorted_uids: Optional[List[int]] = None
+        self._declared_layout_native = None  # DeclaredLayout for _sorted_uids; see _declared_layout
         self._selected_engine_cache = None  # (plan config, engine); see selected_engine
 
     # =========================================================================
@@ -1999,6 +2000,17 @@ class pygraph:
                 declared = self._tensor_by_uid.get(uid)
                 name = f" ({declared.name!r})" if declared is not None and declared.name else ""
                 raise ValueError(f"the variant pack is missing a buffer for tensor uid {uid}{name}")
+        # The declaration is the contract. The backend reads only the pointer,
+        # so a caller may bind a 2-D matrix to a [1, m, k] tensor, a flat blob
+        # to a reordered scale tensor, a 0-d scalar to (1, 1, 1): the graph
+        # says what the bytes mean. A DENSE buffer of other extents that covers
+        # the declared bytes is therefore re-described AS the declaration --
+        # what a bare address gets -- so an engine reading the pack answers the
+        # way the backend does. A buffer with the declared extents but its own
+        # strides, a strided view, or one too small for the declaration keeps
+        # its own description; the engine decides. The rule runs natively, one
+        # crossing per pack: this is on every execute's critical path.
+        from_graph.extend(native.describe_from(self._declared_layout(order), from_graph))
         if override_uids:
             # The backend refuses a partial override; a short list must not
             # quietly mean "keep the rest" here.
@@ -2012,7 +2024,15 @@ class pygraph:
                 i = slot_of.get(uid)
                 if i is None:
                     raise ValueError(f"override_uids names tensor uid {uid}, which is not an operand of this graph")
-                native.override_operand(i, *_in_axis_order_of(tuple(override_shapes[j]), tuple(override_strides[j]), native.stride(i)))
+                # Overrides speak cuDNN element units; the slot speaks storage slots.
+                declared = self._tensor_by_uid.get(uid)
+                storage = storage_geometry(override_shapes[j], override_strides[j], declared.data_type if declared is not None else None)
+                if storage is None:
+                    raise ValueError(
+                        f"override_shapes for tensor uid {uid}: an fp4 tensor packs two elements per storage slot, so its "
+                        f"unit-stride extent must be even; got {tuple(override_shapes[j])} / {tuple(override_strides[j])}"
+                    )
+                native.override_operand(i, *_in_axis_order_of(storage[0], storage[1], native.stride(i)))
         # The workspace has no uid, so it is not an operand — but an engine has
         # to bounds-check its carves, and reading its size here is the same read
         # every other buffer gets rather than a second probe further down.
@@ -2030,12 +2050,33 @@ class pygraph:
                 workspace_ptr, workspace_bytes = extent
         return VariantPack(tuple(order), native, workspace_ptr, workspace_bytes, tuple(from_graph))
 
+    def _declared_layout(self, order: List[int]):
+        """The storage-slot geometry each slot of ``order`` was declared with,
+        built once per graph: the declaration is fixed once the graph is, and
+        ``storage_geometry`` per operand per execute was a measurable share of
+        the host path. Reset with ``_sorted_uids``."""
+        layout = self._declared_layout_native
+        if layout is None:
+            layout = _pybind_module.DeclaredLayout(len(order))
+            for i, uid in enumerate(order):
+                declared = self._tensor_by_uid.get(uid)
+                if declared is None or not declared.dim:
+                    continue
+                storage = storage_geometry(declared.dim, declared.stride, declared.data_type)
+                if storage is None:
+                    continue
+                layout.set(i, list(storage[0]), list(storage[1]), storage_slot_bytes(declared.data_type) or 0)
+            self._declared_layout_native = layout
+        return layout
+
     def _describe(self, data: Any, uid: int):
         """``(pointer, Tensor)`` for one caller buffer.
 
         The Tensor carries the buffer's OWN dim/stride/data_type, which need
-        not match what the graph declared — frost_gemm takes its problem size
-        from here.
+        not match what the graph declared. ``_normalize`` then re-describes a
+        slot FROM the declaration when the two disagree and the buffer covers
+        it (the declaration is the contract, as for the backend), so what an
+        engine reads is the declaration unless the buffer is smaller.
 
         Every framework publishes the same four facts under a different
         spelling, so this asks for each spelling in turn. Two differences are
@@ -2057,7 +2098,11 @@ class pygraph:
             declared = self._tensor_by_uid.get(uid)
             if declared is None or not declared.dim:
                 return data, Tensor(uid=uid)
-            return data, describing_tensor(uid, tuple(declared.dim), tuple(declared.stride), declared.data_type)
+            # The slot speaks storage slots (fp4: two elements per slot), like
+            # every other description in the pack.
+            storage = storage_geometry(declared.dim, declared.stride, declared.data_type)
+            dim, stride = storage if storage is not None else (tuple(declared.dim), tuple(declared.stride))
+            return data, describing_tensor(uid, tuple(dim), tuple(stride), declared.data_type)
         dim = getattr(data, "shape", None)
 
         # torch: pointer from data_ptr(), strides from stride() in ELEMENTS
@@ -2210,6 +2255,7 @@ class pygraph:
         # The loaded graph carries its own variant_pack, so an order cached while
         # this container held a different graph no longer describes it.
         self._sorted_uids = None
+        self._declared_layout_native = None
 
     def _lower_to_cpp(self) -> Any:
         """Lower Python graph to C++ (the internal ``_pybind_module.backend_graph``)."""

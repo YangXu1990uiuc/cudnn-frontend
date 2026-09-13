@@ -15,6 +15,7 @@
 // its parts.
 #include "variant_pack.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -155,7 +156,74 @@ struct Operand {
     bool filled = false;
 };
 
+// Slots from the base to one past the last addressed slot.
+int64_t
+span_of(const std::vector<int64_t> &shape, const std::vector<int64_t> &stride) {
+    int64_t span = 1;
+    for (size_t d = 0; d < shape.size(); d++) span += (shape[d] - 1) * stride[d];
+    return span;
+}
+
+int64_t
+numel_of(const std::vector<int64_t> &shape) {
+    int64_t n = 1;
+    for (int64_t extent : shape) n *= extent;
+    return n;
+}
+
+std::vector<int64_t>
+dense_stride_of(const std::vector<int64_t> &shape) {
+    std::vector<int64_t> dense(shape.size(), 1);
+    for (int d = static_cast<int>(shape.size()) - 2; d >= 0; d--) dense[d] = dense[d + 1] * shape[d + 1];
+    return dense;
+}
+
 }  // namespace
+
+// The STORAGE-slot geometry every variant-pack slot was declared with. A
+// declaration does not change between executes, so python builds this once per
+// graph and the pack compares a caller's buffer against it in one crossing
+// (VariantPackNative::describe_from) rather than two per operand per call.
+class DeclaredLayout {
+   public:
+    struct Slot {
+        std::vector<int64_t> shape;
+        std::vector<int64_t> stride;
+        int64_t slot_bytes = 0;  // 0: width unknown, never re-described from
+        int64_t span       = 0;
+        bool present       = false;
+    };
+
+    explicit DeclaredLayout(size_t n) : slots_(n) {}
+
+    void
+    set(size_t index, std::vector<int64_t> shape, std::vector<int64_t> stride, int64_t slot_bytes) {
+        if (shape.size() != stride.size()) {
+            throw py::value_error("declared shape and stride must have the same rank; got " +
+                                  std::to_string(shape.size()) + " and " + std::to_string(stride.size()) +
+                                  " for slot " + std::to_string(index));
+        }
+        Slot &slot      = slots_.at(index);
+        slot.span       = span_of(shape, stride);
+        slot.shape      = std::move(shape);
+        slot.stride     = std::move(stride);
+        slot.slot_bytes = slot_bytes;
+        slot.present    = true;
+    }
+
+    const std::vector<Slot> &
+    slots() const {
+        return slots_;
+    }
+
+    size_t
+    size() const {
+        return slots_.size();
+    }
+
+   private:
+    std::vector<Slot> slots_;
+};
 
 // A pack's operand, exposed to a kernel. It implements the same exchange protocol
 // it was read through, so a consumer that has the fast path for a torch tensor
@@ -539,6 +607,38 @@ class VariantPackNative {
         pointers_[index]           = nullptr;
     }
 
+    // The declaration is the contract (see _pygraph._normalize): a filled operand
+    // of OTHER extents that is one dense run of slots and covers the declared
+    // bytes is re-described AS the declaration. The declared extents under the
+    // caller's own strides, a strided view, or a buffer too small keep their own
+    // description. `skip` names the slots already described from the graph (a
+    // bare address). Returns the indices re-described, in slot order.
+    std::vector<size_t>
+    describe_from(const DeclaredLayout &declared, const std::vector<size_t> &skip) {
+        std::vector<size_t> described;
+        const auto &slots = declared.slots();
+        for (size_t i = 0; i < operands_.size() && i < slots.size(); i++) {
+            const DeclaredLayout::Slot &want = slots[i];
+            Operand &operand                 = operands_[i];
+            if (!want.present || want.slot_bytes <= 0 || !operand.filled) continue;
+            if (std::find(skip.begin(), skip.end(), i) != skip.end()) continue;
+            if (operand.shape == want.shape) continue;
+            const int64_t own_span =
+                operand.stride.empty() ? numel_of(operand.shape) : span_of(operand.shape, operand.stride);
+            if (own_span != numel_of(operand.shape)) continue;
+            // BYTES, not slots: a uint8 view spanning as many slots as a bf16
+            // declaration covers half its bytes. A width the producer did not
+            // spell (bits == 0) never qualifies.
+            const int64_t own_bytes = (static_cast<int64_t>(operand.dtype.bits) * operand.dtype.lanes + 7) / 8;
+            if (own_bytes <= 0 || own_span * own_bytes < want.span * want.slot_bytes) continue;
+            operand.ndim   = static_cast<int32_t>(want.shape.size());
+            operand.shape  = want.shape;
+            operand.stride = want.stride;
+            described.push_back(i);
+        }
+        return described;
+    }
+
     bool
     all_contiguous(std::string &offender) const {
         for (size_t i = 0; i < operands_.size(); i++) {
@@ -832,6 +932,14 @@ instead of one per region.
 
     operand_class.attr("view") = operand_class.attr("reshape");
 
+    py::class_<DeclaredLayout>(m, "DeclaredLayout", R"(
+The storage-slot geometry each variant-pack slot was declared with, built once
+per graph; ``VariantPackNative.describe_from`` compares a whole pack against it.
+)")
+        .def(py::init<size_t>())
+        .def("set", &DeclaredLayout::set)
+        .def("__len__", &DeclaredLayout::size);
+
     py::class_<VariantPackNative>(m, "VariantPackNative", R"(
 The caller's operands, held as DLTensors.
 
@@ -846,6 +954,7 @@ its parts.
         .def("first_unfilled", &VariantPackNative::first_unfilled)
         .def("set_operand", &VariantPackNative::set_operand)
         .def("override_operand", &VariantPackNative::override_operand)
+        .def("describe_from", &VariantPackNative::describe_from)
         .def("skip_operand", &VariantPackNative::skip_operand)
         .def("operand_contiguous", &VariantPackNative::operand_contiguous)
         .def("is_filled", &VariantPackNative::is_filled)
