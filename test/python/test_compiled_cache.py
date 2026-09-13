@@ -236,6 +236,13 @@ def test_prune_retires_dead_environments_oldest_first_and_keeps_the_current_one(
     assert not dead.exists() and not old.exists() and mid.exists() and cur.exists()
     assert cc.stats()["pruned"] == 2
     assert cc.prune(tmp_path, limit=2500, keep=cur) == 0  # under the cap: nothing to do
+    # a symlink planted in the root is neither followed nor a deletion target
+    outside = tmp_path.parent / f"{tmp_path.name}_outside"
+    outside.mkdir()
+    (outside / "victim").write_bytes(b"y" * 10_000)
+    (tmp_path / cc._SCHEMA / "link").symlink_to(outside, target_is_directory=True)
+    assert cc.prune(tmp_path, limit=1, keep=cur) == 1 and not mid.exists() and cur.exists()
+    assert (outside / "victim").exists() and (tmp_path / cc._SCHEMA / "link").is_symlink()
     monkeypatch.setenv(cc._ENV_MAX_BYTES, "0")
     assert cc.max_bytes() == 0
     monkeypatch.setenv(cc._ENV_MAX_BYTES, "not-a-number")

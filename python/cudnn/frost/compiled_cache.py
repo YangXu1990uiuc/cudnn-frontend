@@ -376,7 +376,7 @@ def max_bytes() -> int:
 
 def _dir_bytes_and_mtime(path: Path):
     total, newest = 0, 0.0
-    for dirpath, _dirs, files in os.walk(path):
+    for dirpath, _dirs, files in os.walk(path, followlinks=False):
         for name in files:
             try:
                 st = os.stat(os.path.join(dirpath, name))
@@ -403,12 +403,17 @@ def prune(root: Optional[Path] = None, limit: Optional[int] = None, keep: Option
     limit = max_bytes() if limit is None else limit
     if limit <= 0 or not root.is_dir():
         return 0
+    resolved_root = root.resolve()
     envs = []
+    # Symlinks are never followed and nothing outside the resolved root is ever
+    # a deletion target: a link planted in the cache must not redirect rmtree.
     for schema_dir in root.iterdir():
-        if not schema_dir.is_dir():
+        if schema_dir.is_symlink() or not schema_dir.is_dir():
             continue
         for env in schema_dir.iterdir():
-            if not env.is_dir():
+            if env.is_symlink() or not env.is_dir():
+                continue
+            if not env.resolve().is_relative_to(resolved_root):
                 continue
             size, mtime = _dir_bytes_and_mtime(env)
             envs.append((schema_dir.name != _SCHEMA, mtime, size, env))
@@ -520,7 +525,8 @@ def compile_cached(fn: Callable, *args: Any, cache_key: Optional[str], symbol: s
         # incompatible stacks with the same unknowns would otherwise hash alike.
         _count("bypassed")
         return cute.compile(fn, *args, **kwargs)
-    entry = _entry_dir(get_cache_dir(), manifest, f"{cache_key}|{symbol}|{options}")
+    root = get_cache_dir()  # one root for the export and the prune that follows it
+    entry = _entry_dir(root, manifest, f"{cache_key}|{symbol}|{options}")
     loaded = _try_load(entry, cache_key, symbol)
     if loaded is not None:
         _count("hits")
@@ -539,7 +545,7 @@ def compile_cached(fn: Callable, *args: Any, cache_key: Optional[str], symbol: s
         _count("export_failed")
         _LOG.warning("compiled-plan cache: could not persist %s (%s); the kernel will be recompiled next process", entry, exc)
         return compiled
-    _prune_once(get_cache_dir(), entry.parent)  # this process's first write: retire dead environments
+    _prune_once(root, entry.parent)  # this process's first write: retire dead environments
     # Hand back the artifact rather than the in-process object, so a hit and a
     # miss run the same thing and a bad artifact fails here, not next start-up.
     loaded = _try_load(entry, cache_key, symbol)
