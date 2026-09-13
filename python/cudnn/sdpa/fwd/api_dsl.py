@@ -446,7 +446,6 @@ class SdpaFwdDsl(APIBase):
         cu_seq_kv_lens: bool = False,
         has_sink: bool = False,
         thd: bool = False,
-        thd_stats_padded: bool = False,
         max_total_seq_len_q: Optional[int] = None,
         max_total_seq_len_kv: Optional[int] = None,
         dtype_o: Optional[torch.dtype] = None,
@@ -462,6 +461,7 @@ class SdpaFwdDsl(APIBase):
         paged_max_seq_len_kv: Optional[int] = None,
         paged_table_stride: Optional[tuple] = None,
         paged_table_v_stride: Optional[tuple] = None,
+        thd_stats_padded: bool = False,
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
 
