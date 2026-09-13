@@ -326,6 +326,26 @@ def test_sm107_f16_declines_the_stats_trim_it_lacks():
     assert caps.dense_seq_q_trim is False
 
 
+def test_dense_padded_q_lengths_decline_at_plan_time_on_trim_less_rows():
+    """A dense padded graph carrying per-batch seq_len_q may reach only a row
+    whose kernel trims padded Q rows (O := 0, LSE := -inf past each length).
+    The lengths are device data, so a trim-less row cannot know at execute
+    whether any is shorter than S_q without a host read -- which is what it
+    used to do, on every call, breaking CUDA-graph capture. It declines at
+    check_support instead; the backend serves the form."""
+    from cudnn.sdpa.fwd import engines
+
+    facts = dict(padded=True, seq_q_t=object(), seq_kv_t=object())
+    reason = engines.mismatch(_caps("sdpa_fwd_prefill_sm107"), _f16_facts(**facts))
+    assert reason is not None and "padded-Q trim" in reason, reason
+    # the SM100 f16 row trims, so the same graph is not declined for THIS reason
+    reason = engines.mismatch(_caps("sdpa_fwd_prefill_sm100"), _f16_facts(device_cc=(10, 0), **facts))
+    assert reason is None or "padded-Q trim" not in reason, reason
+    # without per-batch Q lengths a padded graph still reaches the trim-less row
+    reason = engines.mismatch(_caps("sdpa_fwd_prefill_sm107"), _f16_facts(padded=True, seq_kv_t=object()))
+    assert reason is None or "padded-Q trim" not in reason, reason
+
+
 def test_sm107_rows_serve_natural_scheduling_only():
     """The ROW-WIDE floor of every Rubin row stays NATURAL-only: LPT is claimed
     per flavor (`sched_policies_by_d_shape`) where it is validated -- the f16

@@ -677,7 +677,11 @@ DECLARATION (operand rank, blob size, scalar shape, layout) may refuse a call
 after acceptance: it is decided at `check_support`, and the pack hands the
 engine the declaration. Buffer capacity is not decidable before execute — the
 buffers arrive with the call — so a buffer smaller than its declaration is a
-caller error refused at execute, not a decline. `test/python/gemm/frost/test_flashinfer_shaped_gemm.py`
+caller error refused at execute, not a decline. A fact that lives only in device data (per-batch Q lengths shorter than the
+declared S_q) is not decidable at either point without a host read, so a row
+whose kernel cannot honor every value of it declines at `check_support` rather
+than reading it back at execute: the execute path stays free of host syncs and
+captures into a CUDA graph. `test/python/gemm/frost/test_flashinfer_shaped_gemm.py`
 and `test/python/sdpa/frost/test_flashinfer_shaped_sdpa.py` re-declare
 FlashInfer's graphs and buffers byte for byte and assert exactly this; a decline
 at `check_support` is reported as xfail with the row's reason, a refusal after
@@ -842,6 +846,4 @@ defaulting to device 0 is how an SM100 suite silently skips in full.
   `OpSpec` as the single per-op source for builder/validation/lowering.
 - SDPA forward THD, padded Stats: the `-inf` seed of the `(b, s_max, h)` buffer
   is a separate D32 memset ahead of the kernel; fold the tail-row write into the
-  kernel's persistent schedule to save the launch on that path. The dense
-  padded-Q `.item()` read in `sdpa/fwd/engines.py` runs at execute and breaks
-  CUDA-graph capture; decide it at `check_support` or drop it.
+  kernel's persistent schedule to save the launch on that path.

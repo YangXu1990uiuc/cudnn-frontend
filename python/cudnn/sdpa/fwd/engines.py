@@ -632,6 +632,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "graph uses bottom-right causal, which this kernel does not support"
     if facts.padded and facts.wants_stats and not facts.thd and not (capabilities.padded_stats or supports_dense_seq_q_trim(capabilities, facts)):
         return "padding mask with generate_stats is not supported yet (per-batch seq_len_q LSE trim not plumbed)"
+    if facts.padded and not facts.thd and facts.seq_q_t is not None and not supports_dense_seq_q_trim(capabilities, facts):
+        # The per-batch Q lengths are device data, so whether any is shorter
+        # than S_q cannot be known here -- and a kernel without the trim would
+        # write O and a finite LSE past a shorter length. Deciding at execute
+        # meant a host read (.item()) on every call, which breaks CUDA-graph
+        # capture; the row declines the form instead (the backend serves it).
+        return "dense padded Q with per-batch seq_len_q: this kernel has no padded-Q trim (rows past a shorter length would be written)"
 
     if (
         facts.thd
@@ -1346,11 +1353,9 @@ def lower_dsl_prefill(
     seq_q_t = facts.seq_q_t if facts.padded else None
     seq_kv_t = facts.seq_kv_t if facts.padded else None
     # Mirrors the seq_q_lens_present constructor argument below. Execute
-    # forwards seq_q only when the compiled specialization consumes it (or THD,
-    # which sources cu_seqlens from it) — the adapter rejects mismatches, so a
-    # buffer a trim-less kernel can't honor is dropped here rather than
-    # erroring at execute (the row declares plumbed-ness; see
-    # Capabilities.dense_seq_q_trim).
+    # forwards seq_q when the compiled specialization consumes it (or THD,
+    # which sources cu_seqlens from it); a dense padded graph carrying Q
+    # lengths never reaches a trim-less row (mismatch() declines it).
     dense_seq_q_trim = supports_dense_seq_q_trim(spec.capabilities, facts)
     seq_q_lens_present = facts.padded and not facts.thd and facts.seq_q_t is not None and dense_seq_q_trim
     api = _adapter(api_type)(
@@ -1526,22 +1531,10 @@ def lower_dsl_prefill(
         dk_buf = resolved.get(id(binding.descale_k)) if binding.descale_k is not None else None
         dv_buf = resolved.get(id(binding.descale_v)) if binding.descale_v is not None else None
         so_buf = resolved.get(id(binding.scale_o)) if binding.scale_o is not None else None
-        # Rows whose kernel lacks the dense padded-Q trim (dense_seq_q_trim
-        # False) drop the per-batch Q lengths, which is harmless only while
-        # every seq_len_q equals S_q -- a shorter one writes O and a finite
-        # LSE past the valid length. Checked here because the lengths are
-        # device values (its own Rule 3 known-violation entry; the descale
-        # scalars themselves no longer read back at all).
-        # THD is exempt: ragged lengths ARE shorter than S_q by construction,
-        # and the packed layout gives each sequence its own extent, so
-        # nothing is written past a valid length.
-        if not dense_seq_q_trim and not facts.thd and seq_q_buf is not None:
-            min_seq_q = int(seq_q_buf.min().item())
-            if min_seq_q < int(facts.s_q):
-                raise NotImplementedError(
-                    f"{spec.name}: per-batch seq_len_q shorter than S_q={facts.s_q} is not plumbed "
-                    f"(no dense padded-Q trim in this kernel); got min {min_seq_q}"
-                )
+        # A dense padded graph with per-batch Q lengths only reaches a row whose
+        # kernel trims padded Q rows (mismatch() declines the others), so the
+        # lengths are never read back here: the execute path has no host sync
+        # and captures into a CUDA graph.
         execute_kwargs = dict(
             q_tensor=q_buf,
             k_tensor=k_buf,
