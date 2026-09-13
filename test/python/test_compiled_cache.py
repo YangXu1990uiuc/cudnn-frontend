@@ -204,3 +204,39 @@ def test_the_manifest_carries_the_source_tree_not_a_commit(tmp_path):
     import cudnn
 
     assert cc.environment_manifest()["cudnn_source"] == cc.source_tree_digest(pathlib.Path(cudnn.__file__).resolve().parent)
+
+
+def test_prune_retires_dead_environments_oldest_first_and_keeps_the_current_one(tmp_path, monkeypatch):
+    """Every edited checkout (and every CI commit) mints an environment that is
+    never hit again; a persistent home would grow by hundreds of MB per commit.
+    Whole environment directories go, dead schemas first, then oldest first,
+    until the root fits; the current environment is never a candidate."""
+    import os
+    import time
+
+    def env(schema, name, size, age_s):
+        d = tmp_path / schema / name
+        d.mkdir(parents=True)
+        (d / "manifest.json").write_text("{}")
+        e = d / "entry_x"
+        e.mkdir()
+        (e / cc._OBJECT).write_bytes(b"x" * size)
+        (e / cc._ENTRY).write_text("{}")
+        for f in d.rglob("*"):
+            os.utime(f, (time.time() - age_s, time.time() - age_s))
+        return d
+
+    old = env(cc._SCHEMA, "old", 1000, 3000)
+    mid = env(cc._SCHEMA, "mid", 1000, 2000)
+    cur = env(cc._SCHEMA, "cur", 1000, 4000)  # the oldest by mtime, but this process's own
+    dead = env("v0", "ancient", 100, 10)  # a dead schema goes first whatever its age
+    cc.reset_stats()
+    assert cc.prune(tmp_path, limit=0) == 0  # 0 = never prune
+    assert cc.prune(tmp_path, limit=2500, keep=cur) == 2
+    assert not dead.exists() and not old.exists() and mid.exists() and cur.exists()
+    assert cc.stats()["pruned"] == 2
+    assert cc.prune(tmp_path, limit=2500, keep=cur) == 0  # under the cap: nothing to do
+    monkeypatch.setenv(cc._ENV_MAX_BYTES, "0")
+    assert cc.max_bytes() == 0
+    monkeypatch.setenv(cc._ENV_MAX_BYTES, "not-a-number")
+    assert cc.max_bytes() == cc._DEFAULT_MAX_BYTES
