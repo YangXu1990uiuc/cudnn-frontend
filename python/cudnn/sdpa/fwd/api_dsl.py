@@ -614,6 +614,13 @@ class SdpaFwdDsl(APIBase):
     # normalization-copy fallback (AGENTS.md Hard Rule 2) — so the router
     # picks an engine that honors them instead.
 
+    def _thd_padded_lse_view(self, lse_tensor):
+        """The per-batch padded (b, h, s_max) Stats view in the declared strides,
+        or None when this plan does not bind one."""
+        if lse_tensor is None or not self.thd_stats_padded:
+            return None
+        return lse_tensor.as_strided((self.batch_size, self.h_q, self.s_q_max), self._lse_stride, lse_tensor.storage_offset())
+
     def _seed_padded_lse(self, LSE, current_stream) -> None:
         """Per-batch padded Stats: the kernel writes the rows a sequence has; the
         backend's contract for the form is -inf on the rest, so the whole buffer
@@ -1233,6 +1240,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if self.lse_desc is not None:
             self._check_dtype(self.lse_desc, torch.float32, name="LSE")
             self._check_tensor_shape(self.lse_desc, (b, h_qo, s_qo), name="LSE")
+            self._value_error_if(
+                self.thd_stats_padded and not self.thd,
+                "thd_stats_padded is THD-only (a padded Stats without ragged offsets); construct the API with thd=True",
+            )
             if self.thd and self.thd_stats_padded:
                 # Per-batch padded Stats (no ragged offsets): (b, h, s_max) in
                 # any non-overlapping layout -- the kernel indexes [batch, head,
@@ -2346,6 +2357,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         if pack is None:
             self._logger.debug("execute (THD): no addressable Q token, nothing to do")
+            # no addressable Q token: every padded Stats row is unwritten, and the contract is -inf on all of them
+            self._seed_padded_lse(self._thd_padded_lse_view(lse_tensor), current_stream)
             return
         LSE = self._thd_lse_view(lse_tensor, pack.t_q)
 
@@ -2516,6 +2529,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             )
             if pack is None:
                 self._logger.debug("execute (MXFP8 THD): no addressable Q token, nothing to do")
+                # no addressable Q token: every padded Stats row is unwritten, and the contract is -inf on all of them
+                self._seed_padded_lse(self._thd_padded_lse_view(lse_tensor), current_stream)
                 return
             sf_q_v = self._reshape_sf_packed(sf_q, h_q, km.SF_SMEM_SIZE_Q, "sf_q", current_stream)
             sf_k_v = self._reshape_sf_packed(sf_k, h_kv, km.SF_SMEM_SIZE_K, "sf_k", current_stream)
@@ -2699,6 +2714,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             )
             if pack is None:
                 self._logger.debug("execute (FP8 THD): no addressable Q token, nothing to do")
+                # no addressable Q token: every padded Stats row is unwritten, and the contract is -inf on all of them
+                self._seed_padded_lse(self._thd_padded_lse_view(lse_tensor), current_stream)
                 return
             LSE = self._thd_lse_view(lse_tensor, pack.t_q)
             self._seed_padded_lse(LSE, current_stream)
@@ -3125,6 +3142,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         if self.lse_desc is not None:
             self._check_dtype(self.lse_desc, torch.float32, name="LSE")
             self._check_tensor_shape(self.lse_desc, (b, h_q, s_q), name="LSE")
+            self._value_error_if(
+                self.thd_stats_padded and not self.thd,
+                "thd_stats_padded is THD-only (a padded Stats without ragged offsets); construct the API with thd=True",
+            )
             if self.thd and self.thd_stats_padded:
                 # per-batch padded Stats (no ragged offsets): (b, h, s_max) in any
                 # non-overlapping layout; the kernel indexes [batch, head, row]
@@ -3688,6 +3709,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 lse_tokens_cap=lse_cap,
             )
             if pack is None:
+                # no addressable Q token: every padded Stats row is unwritten, and the contract is -inf on all of them
+                self._seed_padded_lse(self._thd_padded_lse_view(lse_tensor), current_stream)
                 return
             # The kernel specializes on either ragged-Stats layout:
             #   token-major packed (T, H) or head-major (H, head_stride)
@@ -3984,6 +4007,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             lse_tokens_cap=lse_cap,
         )
         if pack is None:
+            # no addressable Q token: every padded Stats row is unwritten, and the contract is -inf on all of them
+            self._seed_padded_lse(self._thd_padded_lse_view(lse_tensor), current_stream)
             return
 
         lse = None
