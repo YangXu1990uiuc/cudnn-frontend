@@ -614,6 +614,23 @@ class SdpaFwdDsl(APIBase):
     # normalization-copy fallback (AGENTS.md Hard Rule 2) — so the router
     # picks an engine that honors them instead.
 
+    def _seed_padded_lse(self, LSE, current_stream) -> None:
+        """Per-batch padded Stats: the kernel writes the rows a sequence has; the
+        backend's contract for the form is -inf on the rest, so the whole buffer
+        is seeded first, on the launch stream (a D32 memset, no kernel). Every
+        THD execute path that binds a padded LSE calls this before its launch."""
+        if LSE is None or not self.thd_stats_padded:
+            return
+        from cudnn.frost import buffers as _buffers
+
+        stream = int(current_stream) if current_stream is not None else torch.cuda.current_stream(LSE.device).cuda_stream
+        word = _buffers.init_word("fp32", float("-inf"))
+        shape, strides = tuple(LSE.shape), tuple(LSE.stride())
+        if _buffers.is_contiguous(shape, strides):
+            _buffers.fill_word_async(LSE.data_ptr(), int(LSE.numel()), word, stream)
+        else:
+            _buffers.fill_word_strided_async(LSE.data_ptr(), shape, strides, 4, word, stream)
+
     @staticmethod
     def _thd_declared(desc: TensorDesc):
         """(token, head, elem) strides a THD tensor declares, and whether they
@@ -2273,23 +2290,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             return None  # padded rows are per batch, not a packed-token capacity
         return lse_tensor.numel() // self.h_q
 
-    def _seed_padded_lse(self, LSE, current_stream) -> None:
-        """Per-batch padded Stats: the kernel writes the rows a sequence has; the
-        backend's contract for the form is -inf on the rest, so the whole buffer
-        is seeded first, on the launch stream (a D32 memset, no kernel). Every
-        THD execute path that binds a padded LSE calls this before its launch."""
-        if LSE is None or not self.thd_stats_padded:
-            return
-        from cudnn.frost import buffers as _buffers
-
-        stream = int(current_stream) if current_stream is not None else torch.cuda.current_stream(LSE.device).cuda_stream
-        word = _buffers.init_word("fp32", float("-inf"))
-        shape, strides = tuple(LSE.shape), tuple(LSE.stride())
-        if _buffers.is_contiguous(shape, strides):
-            _buffers.fill_word_async(LSE.data_ptr(), int(LSE.numel()), word, stream)
-        else:
-            _buffers.fill_word_strided_async(LSE.data_ptr(), shape, strides, 4, word, stream)
-
     def _thd_lse_view(self, lse_tensor, t_q):
         """The caller's ragged Stats buffer in its declared layout — token-major
         packed rank-2 (T, H) (the default; cuDNN's TH1 ragged Stats recipe) or
@@ -3125,7 +3125,15 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         if self.lse_desc is not None:
             self._check_dtype(self.lse_desc, torch.float32, name="LSE")
             self._check_tensor_shape(self.lse_desc, (b, h_q, s_q), name="LSE")
-            if self.thd:
+            if self.thd and self.thd_stats_padded:
+                # per-batch padded Stats (no ragged offsets): (b, h, s_max) in any
+                # non-overlapping layout; the kernel indexes [batch, head, row]
+                self._value_error_if(
+                    not dense_layout_ok((*self.lse_desc.shape, 1), (*self.lse_desc.stride, 1)),
+                    f"THD padded LSE must be a non-overlapping (b, h, s_max) layout; got stride {self.lse_desc.stride}",
+                )
+                self._lse_stride = tuple(int(stride) for stride in self.lse_desc.stride)
+            elif self.thd:
                 stride_h, stride_s = tuple(self.lse_desc.stride[1:])
                 token_major = (stride_h, stride_s) == (1, h_q)
                 head_major = not token_major and stride_s == 1 and stride_h >= 1
@@ -3666,7 +3674,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # capacity joins their floor; head-major carries its own declared
             # head_stride (covering the packed total is caller contract — t_q
             # is a device value, Rule 3).
-            lse_cap = lse_tensor.numel() // self.h_q if (lse_tensor is not None and not self.thd_stats_head_major) else None
+            lse_cap = lse_tensor.numel() // self.h_q if (lse_tensor is not None and not self.thd_stats_head_major and not self.thd_stats_padded) else None
             pack = self._thd_pack(
                 q_tensor,
                 k_tensor,
@@ -3685,11 +3693,15 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             #   token-major packed (T, H) or head-major (H, head_stride)
             lse = None
             if lse_tensor is not None:
-                if self.thd_stats_head_major:
+                if self.thd_stats_padded:
+                    # per-batch padded (b, h, s_max) in the declared strides
+                    lse = lse_tensor.as_strided((self.batch_size, self.h_q, self.s_q_max), self._lse_stride, lse_tensor.storage_offset())
+                elif self.thd_stats_head_major:
                     head_stride = self.thd_stats_head_stride
                     lse = lse_tensor.as_strided((self.h_q, head_stride), (head_stride, 1), lse_tensor.storage_offset())
                 else:
                     lse = lse_tensor.as_strided((pack.t_q, self.h_q), (self.h_q, 1), lse_tensor.storage_offset())
+            self._seed_padded_lse(lse, current_stream)  # -inf on the rows past each sequence's length (padded Stats only)
         else:
             seq_kv_t = (
                 self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
@@ -3801,6 +3813,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             d_v=self.head_dim_v,
             has_lse=has_lse,
             lse_head_stride=self.thd_stats_head_stride,
+            # padded per-batch Stats: the (B, QH, s_max) fake in the declared strides
+            lse_padded_rows=(self.s_q_max if (has_lse and self.thd_stats_padded) else 0),
+            lse_stride=(self._lse_stride if (has_lse and self.thd_stats_padded) else None),
         )
         if self._fp8:
             # The FP8 cell serves only the packed contract (no stride keys);
@@ -3954,7 +3969,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         # capacity joins their floor; head-major carries its own declared
         # head_stride (covering the packed total is caller contract — t_q is
         # a device value, Rule 3).
-        lse_cap = lse_tensor.numel() // self.h_q if (lse_tensor is not None and not self.thd_stats_head_major) else None
+        lse_cap = lse_tensor.numel() // self.h_q if (lse_tensor is not None and not self.thd_stats_head_major and not self.thd_stats_padded) else None
         pack = self._thd_pack(
             q_buf,
             k_buf,
@@ -3973,11 +3988,15 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
         lse = None
         if lse_tensor is not None:
-            if self.thd_stats_head_major:
+            if self.thd_stats_padded:
+                # per-batch padded (b, h, s_max) in the declared strides
+                lse = lse_tensor.as_strided((self.batch_size, self.h_q, self.s_q_max), self._lse_stride, lse_tensor.storage_offset())
+            elif self.thd_stats_head_major:
                 head_stride = self.thd_stats_head_stride
                 lse = lse_tensor.as_strided((self.h_q, head_stride), (head_stride, 1), lse_tensor.storage_offset())
             else:
                 lse = lse_tensor.as_strided((pack.t_q, self.h_q), (self.h_q, 1), lse_tensor.storage_offset())
+        self._seed_padded_lse(lse, current_stream)  # -inf on the rows past each sequence's length (padded Stats only)
 
         # Sinks are None-specialized like the LSE when the graph has no sink
         # token.

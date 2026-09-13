@@ -1257,6 +1257,7 @@ def _sm120_spec() -> EngineSpec:
             padded_stats=True,
             dense_seq_q_trim=True,
             thd=True,
+            thd_padded_stats=True,
             # No KV-tail rule: the kernel walks KV tiles right-to-left and its
             # first (masked) step always covers the rightmost — and therefore
             # any partial — tile, comparing columns against seqlen_k regardless

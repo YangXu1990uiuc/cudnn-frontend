@@ -27,9 +27,13 @@ import torch
 
 import cudnn
 from cudnn.engines import is_python_engine
-from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell
+from frost_test_utils import _SM, requires_dsl
 
-pytestmark = [pytest.mark.L0, requires_pre_rubin_blackwell, requires_dsl]
+requires_thd_frost_row = pytest.mark.skipif(
+    _SM is None or not (100 <= _SM <= 107 or _SM == 120),
+    reason="needs an arch with a frost THD (ragged) SDPA forward row: SM100-line, SM107 or SM120; have " + ("none" if _SM is None else f"sm_{_SM}"),
+)
+pytestmark = [pytest.mark.L0, requires_thd_frost_row, requires_dsl]
 
 # flashinfer/cudnn/prefill.py UIDs, kept identical.
 Q_UID, K_UID, V_UID, O_UID, STATS_UID = 0, 1, 2, 3, 4
