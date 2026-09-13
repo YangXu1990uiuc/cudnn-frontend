@@ -1983,7 +1983,7 @@ def compile(  # noqa: A001
     # means the engine's Capabilities row is lying, which is the failure we
     # want loud.  (Capabilities: lse_optional=False, no strided Stats.)
     _cache_key = _template_key(globals(), locals(), "compile")
-    if lse_stride is not None:
+    if lse_stride is not None and not lse_padded_rows:  # a padded THD Stats carries its declared strides
         raise NotImplementedError(f"{__name__}: strided Stats not ported (contiguous [B, H, S] only)")
     if d_qk > CFG.TILE_K or d_v > CFG.TILE_O or d_qk <= 0 or d_v <= 0:
         raise ValueError(f"{__name__}: envelope is 0 < d_qk <= {CFG.TILE_K}, 0 < d_v <= {CFG.TILE_O}; " f"got ({d_qk}, {d_v})")

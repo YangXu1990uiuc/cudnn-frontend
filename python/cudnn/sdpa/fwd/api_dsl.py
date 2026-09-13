@@ -2273,6 +2273,23 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             return None  # padded rows are per batch, not a packed-token capacity
         return lse_tensor.numel() // self.h_q
 
+    def _seed_padded_lse(self, LSE, current_stream) -> None:
+        """Per-batch padded Stats: the kernel writes the rows a sequence has; the
+        backend's contract for the form is -inf on the rest, so the whole buffer
+        is seeded first, on the launch stream (a D32 memset, no kernel). Every
+        THD execute path that binds a padded LSE calls this before its launch."""
+        if LSE is None or not self.thd_stats_padded:
+            return
+        from cudnn.frost import buffers as _buffers
+
+        stream = int(current_stream) if current_stream is not None else torch.cuda.current_stream(LSE.device).cuda_stream
+        word = _buffers.init_word("fp32", float("-inf"))
+        shape, strides = tuple(LSE.shape), tuple(LSE.stride())
+        if _buffers.is_contiguous(shape, strides):
+            _buffers.fill_word_async(LSE.data_ptr(), int(LSE.numel()), word, stream)
+        else:
+            _buffers.fill_word_strided_async(LSE.data_ptr(), shape, strides, 4, word, stream)
+
     def _thd_lse_view(self, lse_tensor, t_q):
         """The caller's ragged Stats buffer in its declared layout — token-major
         packed rank-2 (T, H) (the default; cuDNN's TH1 ragged Stats recipe) or
@@ -2343,19 +2360,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if not self.paged:
             kwargs.update(k_stride=(0, *pack.K.stride()[1:]), v_stride=(0, *pack.V.stride()[1:]))
         fn = self._k_mod.compile(**kwargs)
-        if LSE is not None and self.thd_stats_padded:
-            # The kernel writes the rows a sequence has; the backend's contract for
-            # the padded form is -inf on the rest, so the whole buffer is seeded
-            # first, on the launch stream (a D32 memset, no kernel).
-            from cudnn.frost import buffers as _buffers
-
-            _stream = int(current_stream) if current_stream is not None else torch.cuda.current_stream(LSE.device).cuda_stream
-            _word = _buffers.init_word("fp32", float("-inf"))
-            _shape, _strides = tuple(LSE.shape), tuple(LSE.stride())
-            if _buffers.is_contiguous(_shape, _strides):
-                _buffers.fill_word_async(LSE.data_ptr(), int(LSE.numel()), _word, _stream)
-            else:
-                _buffers.fill_word_strided_async(LSE.data_ptr(), _shape, _strides, 4, _word, _stream)
+        self._seed_padded_lse(LSE, current_stream)
         # Paged pools: the block tables follow the THD length slots in the ABI.
         paged_kwargs = {"block_table_tensor": block_table, "block_table_v_tensor": block_table_v} if self.paged else {}
         # The caller's length tensors ride to the setup kernel, which builds
@@ -2516,6 +2521,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             sf_k_v = self._reshape_sf_packed(sf_k, h_kv, km.SF_SMEM_SIZE_K, "sf_k", current_stream)
             sf_v_v = self._reshape_sf_packed(sf_v, h_kv, km.SF_SMEM_SIZE_V, "sf_v", current_stream)
             LSE = self._thd_lse_view(lse_tensor, pack.t_q)
+            self._seed_padded_lse(LSE, current_stream)
             # PLAN-TIME-ONLY compile key: re-binds the artifact compile()
             # already built (packed totals + SF tile extents are dynamic).
             fn = km.compile(**self._thd_compile_kwargs())
@@ -2695,6 +2701,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 self._logger.debug("execute (FP8 THD): no addressable Q token, nothing to do")
                 return
             LSE = self._thd_lse_view(lse_tensor, pack.t_q)
+            self._seed_padded_lse(LSE, current_stream)
             # PLAN-TIME-ONLY compile key: re-binds the artifact compile()
             # already built (the packed totals are dynamic extents).
             fn = self._k_mod.compile(**self._thd_compile_kwargs())
