@@ -214,10 +214,11 @@ def test_prune_retires_dead_environments_oldest_first_and_keeps_the_current_one(
     import os
     import time
 
-    def env(schema, name, size, age_s):
-        d = tmp_path / schema / name
+    def env(schema, name, size, age_s, manifest=True):
+        d = tmp_path / schema / (cc._digest(name) if len(name) != 24 else name)
         d.mkdir(parents=True)
-        (d / "manifest.json").write_text("{}")
+        if manifest:
+            (d / cc._MANIFEST).write_text("{}")
         e = d / "entry_x"
         e.mkdir()
         (e / cc._OBJECT).write_bytes(b"x" * size)
@@ -230,10 +231,18 @@ def test_prune_retires_dead_environments_oldest_first_and_keeps_the_current_one(
     mid = env(cc._SCHEMA, "mid", 1000, 2000)
     cur = env(cc._SCHEMA, "cur", 1000, 4000)  # the oldest by mtime, but this process's own
     dead = env("v0", "ancient", 100, 10)  # a dead schema goes first whatever its age
+    # not ours, whatever the size or age: a caller's artifacts under a shared root, a directory without
+    # our manifest, a schema-like directory with a foreign name -- never deleted, never counted
+    foreign = tmp_path / "flashinfer" / "existing_artifact"
+    foreign.mkdir(parents=True)
+    (foreign / "caller_owned.bin").write_bytes(b"z" * 100_000)
+    no_manifest = env(cc._SCHEMA, "half_written", 100_000, 9000, manifest=False)
+    odd_name = env(cc._SCHEMA, "x" * 24, 100_000, 9000)  # 24 chars but not a hex digest
     cc.reset_stats()
     assert cc.prune(tmp_path, limit=0) == 0  # 0 = never prune
     assert cc.prune(tmp_path, limit=2500, keep=cur) == 2
     assert not dead.exists() and not old.exists() and mid.exists() and cur.exists()
+    assert (foreign / "caller_owned.bin").exists() and no_manifest.exists() and odd_name.exists()
     assert cc.stats()["pruned"] == 2
     assert cc.prune(tmp_path, limit=2500, keep=cur) == 0  # under the cap: nothing to do
     # a symlink planted in the root is neither followed nor a deletion target

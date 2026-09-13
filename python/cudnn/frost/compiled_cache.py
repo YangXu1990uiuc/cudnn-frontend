@@ -60,6 +60,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -75,6 +76,8 @@ _DEFAULT_MAX_BYTES = 4 * 1024**3  # every environment the root has seen, togethe
 _OBJECT = "kernel.o"
 _ENTRY = "entry.json"
 _MANIFEST = "manifest.json"
+_SCHEMA_DIR = re.compile(r"v[0-9]+")  # the shape of a schema directory name ...
+_DIGEST_DIR = re.compile(r"[0-9a-f]{24}")  # ... and of an environment / entry directory name (see _digest)
 
 _LOG = logging.getLogger("cudnn.frost.compiled_cache")
 _LOCK = threading.Lock()
@@ -398,6 +401,10 @@ def prune(root: Optional[Path] = None, limit: Optional[int] = None, keep: Option
     environment is either current (``keep``, this process's own) or dead.
     Other schema versions' roots are dead outright and go first. A directory
     another live process is still reading only costs that process misses.
+    Only directories this cache made are candidates -- a ``v<N>`` schema
+    directory, under it an environment named by our digest and carrying our
+    manifest; a caller who points the root at a shared directory keeps
+    everything else, uncounted.
     """
     root = Path(root) if root is not None else get_cache_dir()
     limit = max_bytes() if limit is None else limit
@@ -408,12 +415,12 @@ def prune(root: Optional[Path] = None, limit: Optional[int] = None, keep: Option
     # Symlinks are never followed and nothing outside the resolved root is ever
     # a deletion target: a link planted in the cache must not redirect rmtree.
     for schema_dir in root.iterdir():
-        if schema_dir.is_symlink() or not schema_dir.is_dir():
+        if schema_dir.is_symlink() or not schema_dir.is_dir() or not _SCHEMA_DIR.fullmatch(schema_dir.name):
             continue
         for env in schema_dir.iterdir():
-            if env.is_symlink() or not env.is_dir():
+            if env.is_symlink() or not env.is_dir() or not _DIGEST_DIR.fullmatch(env.name):
                 continue
-            if not env.resolve().is_relative_to(resolved_root):
+            if not env.resolve().is_relative_to(resolved_root) or not (env / _MANIFEST).is_file():
                 continue
             size, mtime = _dir_bytes_and_mtime(env)
             envs.append((schema_dir.name != _SCHEMA, mtime, size, env))
