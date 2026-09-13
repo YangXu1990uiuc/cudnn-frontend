@@ -6,6 +6,7 @@ whole manifest, an entry is only ever reused under its own embedded key, and
 anything doubtful is a miss."""
 
 import json
+import pathlib
 
 import pytest
 
@@ -17,7 +18,18 @@ pytestmark = pytest.mark.L0
 
 def test_manifest_names_every_dependency_and_is_deterministic():
     m = cc.environment_manifest()
-    for field in ("schema", "cudnn_frontend", "cutlass_dsl", "tvm_ffi", "cuda_driver", "device_name", "compute_capability", "sm_count", "l2_bytes"):
+    for field in (
+        "schema",
+        "cudnn_frontend",
+        "cudnn_source",
+        "cutlass_dsl",
+        "tvm_ffi",
+        "cuda_driver",
+        "device_name",
+        "compute_capability",
+        "sm_count",
+        "l2_bytes",
+    ):
         assert field in m and isinstance(m[field], str) and m[field], field
     assert m["schema"] == cc._SCHEMA and m["cudnn_frontend"] == cudnn.__version__
     assert cc.environment_manifest() == m  # same process, same answer
@@ -173,3 +185,22 @@ def test_the_loader_digests_the_file_and_the_params(tmp_path):
     src.write_text("CFG = FROST_TEMPLATE_PARAMS  # edited\n")
     c = template_loader.load_template(str(src), Params(None), tag="tiny")  # a new params value forces a re-read
     assert c.FROST_SOURCE_DIGEST not in (a.FROST_SOURCE_DIGEST, b.FROST_SOURCE_DIGEST)
+
+
+def test_the_manifest_carries_the_source_tree_not_a_commit(tmp_path):
+    """An edit anywhere in the package -- committed or not -- lands in another
+    environment directory; a wheel hashes the same every process."""
+    (tmp_path / "a.py").write_text("x = 1\n")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "b.py").write_text("y = 2\n")
+    (tmp_path / "sub" / "__pycache__").mkdir()
+    (tmp_path / "sub" / "__pycache__" / "b.cpython-312.pyc").write_bytes(b"ignored")
+    before = cc.source_tree_digest(tmp_path)
+    assert before == cc.source_tree_digest(tmp_path) and len(before) == 16
+    (tmp_path / "sub" / "__pycache__" / "b.cpython-312.pyc").write_bytes(b"still ignored")
+    assert cc.source_tree_digest(tmp_path) == before
+    (tmp_path / "sub" / "b.py").write_text("y = 3\n")  # a shared helper edited, no version bump
+    assert cc.source_tree_digest(tmp_path) != before
+    import cudnn
+
+    assert cc.environment_manifest()["cudnn_source"] == cc.source_tree_digest(pathlib.Path(cudnn.__file__).resolve().parent)

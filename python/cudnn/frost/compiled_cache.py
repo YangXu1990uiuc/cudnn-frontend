@@ -146,6 +146,42 @@ def _dist_version(name: str) -> str:
         return "unknown"
 
 
+_SOURCE_DIGEST: Optional[str] = None
+
+
+def source_tree_digest(root: Path) -> str:
+    """One digest over every ``.py`` under ``root`` (relative path + bytes, sorted).
+
+    A kernel is compiled from more than its own template: the shared frost
+    helpers, the DSL adapters and the generator it imports all shape the traced
+    code, and none of them is in a template's key. The version string covers a
+    wheel; it does not cover a checkout someone is editing, and a stale hit
+    there is a wrong kernel with no error. So the manifest carries the digest
+    of the whole package instead of a commit hash: an uncommitted edit counts
+    too, and an installed wheel hashes the same every time. Computed once per
+    process (a few tens of milliseconds for the tree).
+    """
+    h = hashlib.sha256()
+    for path in sorted(p for p in root.rglob("*.py") if "__pycache__" not in p.parts):
+        h.update(str(path.relative_to(root)).encode("utf-8"))
+        h.update(b"\0")
+        h.update(path.read_bytes())
+        h.update(b"\0")
+    return h.hexdigest()[:16]
+
+
+def _cudnn_source_digest() -> str:
+    global _SOURCE_DIGEST
+    if _SOURCE_DIGEST is None:
+        try:
+            import cudnn
+
+            _SOURCE_DIGEST = source_tree_digest(Path(cudnn.__file__).resolve().parent)
+        except Exception:  # noqa: BLE001 -- a package that cannot be read shares nothing
+            _SOURCE_DIGEST = "unknown"
+    return _SOURCE_DIGEST
+
+
 def environment_manifest(device: Optional[int] = None) -> Dict[str, str]:
     """Everything a compiled object depends on, as deterministic strings.
 
@@ -156,7 +192,7 @@ def environment_manifest(device: Optional[int] = None) -> Dict[str, str]:
     """
     import cudnn
 
-    manifest: Dict[str, str] = {"schema": _SCHEMA, "cudnn_frontend": str(getattr(cudnn, "__version__", "unknown"))}
+    manifest: Dict[str, str] = {"schema": _SCHEMA, "cudnn_frontend": str(getattr(cudnn, "__version__", "unknown")), "cudnn_source": _cudnn_source_digest()}
     try:
         import cutlass
 
