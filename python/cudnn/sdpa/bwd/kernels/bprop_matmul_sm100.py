@@ -1888,9 +1888,11 @@ _CODEGEN_TARGET_SMS = frozenset({100, 103, 107, 110})
 
 @lru_cache(maxsize=None)
 def compile(device) -> Callable:
-    _cache_key = _template_key(globals(), locals(), "compile")
     major, minor = compute_capability(resolve_device(device))
     sm = major * 10 + minor
+    # The device reaches the kernel only as its architecture (--gpu-arch below),
+    # so that is the key; the device object itself would make the call uncacheable.
+    _cache_key = _template_key(globals(), {"sm": sm}, "compile")
     # This is the source-level CODEGEN domain, not the engine's advertised
     # support contract.  The complete three-stage engine remains qualified only
     # on SM100/SM103; SM107/SM110 targets are kept available for isolated
