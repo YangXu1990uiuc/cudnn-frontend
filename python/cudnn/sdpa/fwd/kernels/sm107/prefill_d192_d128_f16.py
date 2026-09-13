@@ -1873,8 +1873,12 @@ def _correction_warp_group(
                             lse_row = lse_arr[_cu_q_b + q_row_global, :]
                             lse_row[head_idx] = lse_val
                         else:
-                            lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
-                            lse_row[_cu_q_b + q_row_global] = lse_val
+                            if cutlass.const_expr(len(lse_tensor.shape) == 4):
+                                # rank-4 = per-batch padded Stats (B, QH, s_max, 1) in the declared strides, no ragged offsets
+                                lse_arr[batch_idx, head_idx, q_row_global, 0] = lse_val
+                            else:
+                                lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
+                                lse_row[_cu_q_b + q_row_global] = lse_val
             else:
                 if cutlass.const_expr(lse_tensor is not None):
                     if q_row_global < seqlen_q:
@@ -2127,6 +2131,7 @@ def compile(  # noqa: A001
     has_lse: bool = True,
     lse_head_major: bool = False,
     lse_head_stride: int = 0,
+    lse_padded_rows: int = 0,
     # The f16 THD compile key carries the caller's DECLARED packed strides
     # (api_dsl._thd_compile_kwargs), unlike the quantized path which selects an
     # exact kernel module and needs none.  Same contract as the SM100 sibling.
@@ -2151,7 +2156,7 @@ def compile(  # noqa: A001
         raise NotImplementedError(f"{__name__}: strided Stats not ported (contiguous [B, H, S] only)")
     if d_qk > CFG.TILE_K or d_v > CFG.TILE_O or d_qk <= 0 or d_v <= 0:
         raise ValueError(f"{__name__}: envelope is 0 < d_qk <= {CFG.TILE_K}, 0 < d_v <= {CFG.TILE_O}; " f"got ({d_qk}, {d_v})")
-    if lse_stride is not None and CFG.THD_VARLEN:
+    if lse_stride is not None and CFG.THD_VARLEN and not lse_padded_rows:
         raise ValueError("dense LSE strides are not valid for a THD workspace")
     _fake_batch = 1 if CFG.THD_VARLEN else b
     if CFG.THD_VARLEN:
@@ -2203,7 +2208,20 @@ def compile(  # noqa: A001
         # store is a scalar f32 and the caller's buffer only guarantees element
         # alignment).  The epilogue branches on the STATIC rank, so the layout
         # is fully encoded here.  Mirrors sm107/prefill_d128_fp8.py.
-        if lse_head_major:
+        if lse_padded_rows:
+            # Per-batch padded Stats without ragged offsets (FlashInfer's (b, s_max, h)
+            # buffer): rank-4 (B, QH, s_max, 1) in the caller's strides -- the RANK is
+            # what selects the per-batch store, so nothing about the extents or
+            # strides has to be static. Rows past a sequence's length are the
+            # adapter's to fill (-inf), as the backend does.
+            if lse_head_major or lse_head_stride:
+                raise ValueError("lse_padded_rows excludes lse_head_major / lse_head_stride")
+            fake_lse = (
+                cute.runtime.make_fake_tensor(cutlass.Float32, (b, qh, lse_padded_rows, 1), (*lse_stride, 1), assumed_align=4)
+                if lse_stride
+                else cute.runtime.make_fake_compact_tensor(cutlass.Float32, (b, qh, lse_padded_rows, 1), stride_order=(3, 2, 1, 0), assumed_align=4)
+            )
+        elif lse_head_major:
             _lse_hs = lse_head_stride if lse_head_stride else sq
             fake_lse = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1, qh, _lse_hs), stride_order=(2, 1, 0), assumed_align=4)
         else:

@@ -255,9 +255,6 @@ def _accept_means_run(case: _Case, *, padded_rows_too: bool = True, decline_ok: 
             assert torch.equal(got[2][i, n:], ref[2][i, n:]), f"batch {i}: padded LSE rows differ from the backend's (-inf): {got[2][i, n:n + 4, 0].tolist()}"
 
 
-_XFAIL_PADDED_LSE = pytest.mark.xfail(strict=True, reason="frost leaves the padded LSE rows of a (b, s_max, h) stats buffer unwritten; the backend writes -inf")
-
-
 @pytest.mark.parametrize("form", ["legacy_offsets", "tokens"])
 @pytest.mark.parametrize("d", [128, 192])
 def test_ragged_prefill_batch_of_two(form, d):
@@ -267,15 +264,12 @@ def test_ragged_prefill_batch_of_two(form, d):
 
 @pytest.mark.parametrize("form", ["legacy_offsets", "tokens"])
 def test_ragged_prefill_batch_of_two_padded_lse(form):
-    """b > 1 with FlashInfer's padded (b, s_max, h) LSE buffer and no stats offsets.
-
-    The packed path writes Stats as contiguous (T, h) rows and has no per-sequence
-    stats base, so this form is a documented decline (the backend serves it) --
-    never a plan that writes the second sequence's rows at the wrong place."""
+    """b > 1 with FlashInfer's padded (b, s_max, h) LSE buffer and no stats offsets:
+    every sequence's rows land in its own batch slot and the rows past each
+    length read -inf, as the backend writes them."""
     _accept_means_run(
         _Case([68, 87], [400, 512], s_q_max=128, s_kv_max=512, tokens_form=form == "tokens", padded_lse=True),
-        padded_rows_too=False,
-        decline_ok="THD Stats without ragged offsets",
+        padded_rows_too=True,
     )
 
 
@@ -297,7 +291,6 @@ def test_ragged_prefill_single_sequence_padded_lse_valid_rows(form, d, d_v, caus
     )
 
 
-@_XFAIL_PADDED_LSE
 @pytest.mark.parametrize("form", ["legacy_offsets", "tokens"])
 @pytest.mark.parametrize("d, d_v, causal", _HEAD_SHAPES)
 def test_ragged_prefill_single_sequence_padded_lse_rows(form, d, d_v, causal):
