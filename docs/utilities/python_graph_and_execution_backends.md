@@ -691,20 +691,21 @@ DSL's own file cache stores only MLIR bytecode, so a process that warms tens
 of plans pays minutes at start-up. `cudnn.frost.compiled_cache` keeps the
 exported tvm-ffi object of every kernel compiled with `--enable-tvm-ffi` and
 reloads it in milliseconds. `compile_cached(fn, *args, cache_key=, symbol=,
-**kwargs)` is the drop-in for `cute.compile` at a kernel's compile site. Every FROST kernel template
-routes through it: the GEMM templates with the digest of their generated
-source as the key (the full GEMM suites: 5655 tests, 20:53 cold, 1:35 warm),
-the SDPA forward / backward and linear-attention templates with
+**kwargs)` is the drop-in for `cute.compile` at a kernel's compile site. Two
+families route through it today: the GEMM templates, with the digest of their
+generated source as the key (the full GEMM suites: 5655 tests, 20:53 cold,
+1:35 warm), and the SDPA forward / backward templates, with
 `template_key(globals(), locals(), "<function>")` as the FIRST statement of
 each function that compiles — the file + params digest `template_loader`
 records as `FROST_SOURCE_DIGEST`, joined with the function's name and its
 arguments, which pin shapes, strides and flags the way the params pin dtypes
-and masks (SDPA SM100 graph-API cases: 24.8 s cold, 2.4 s warm). An argument
-that is not a plain value (a tensor, a device, a dtype object) makes the key
-None and the call compiles as before: the linear-attention `chunk_*`
-launchers, which trace real tensors, and the SDPA adapters' helper kernels in
-`api_dsl` are therefore not cached yet. A hit is the same object a miss
-produced, so the reloaded kernel is called exactly as the in-process one.
+and masks (SDPA + GEMM suites: 5867 tests, 53:06 cold, 2:53 warm). An
+argument that is not a plain value (a tensor, a device, a stream) makes the
+key None and the call compiles as before. Not cached: the linear-attention
+templates (their `compile()` takes traced tensors) and the SDPA adapters'
+helper kernels in `api_dsl`, which compile from real tensors at call time. A
+hit is the same object a miss produced, so the reloaded kernel is called
+exactly as the in-process one.
 
 The rules, borrowed from FlashInfer's autotune cache v2 so that a stale
 artifact can never be reused by accident:
@@ -839,18 +840,6 @@ defaulting to device 0 is how an SM100 suite silently skips in full.
   remove `selected_engine is None` branching, lowering extracted to its own
   module, op-identity dedup (NodeType vs registry keys), longer-term a typed
   `OpSpec` as the single per-op source for builder/validation/lowering.
-- **Persistent compiled-plan cache** for the JIT engines (today `cute.compile`
-  runs once per process; only generated source is cached on disk). Mirror the
-  FlashInfer autotune-cache v2 rules: the environment identity is the content
-  hash of a manifest (frontend version, `nvidia-cutlass-dsl` version incl. its
-  `libs-core` frontend, CUDA driver version, device name + CC + SM count + L2
-  bytes — frost bakes SM count and L2 into kernels) and names the cache
-  directory; every entry embeds its own key (generated-source digest,
-  `cute.compile` options, knobs) and is verified on load; any mismatch,
-  missing or malformed file is a miss, never a partial reuse; writes are
-  temp-file + `os.replace`; an incompatible format bumps the schema directory.
-  Expose the directory / cache object so a caller (FlashInfer) can point it at
-  its own workspace and ship it in an AOT wheel.
 - SDPA forward THD: padded LSE rows of a `(b, s_max, h)` stats buffer past a
   sequence's length — the backend writes `-inf`, the python row leaves them
   unwritten (`b == 1`; at `b > 1` the form is declined) — fill for parity. The

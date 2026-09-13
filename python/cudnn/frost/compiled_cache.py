@@ -13,12 +13,15 @@ instead.
 
 Layout, and the rules that keep a stale artifact from ever being reused:
 
-    <root>/v1/<env_hash>/manifest.json           the environment identity, human-readable
-    <root>/v1/<env_hash>/<entry_hash>/kernel.o   the exported tvm-ffi object
-    <root>/v1/<env_hash>/<entry_hash>/entry.json the key it was stored under (commit marker)
+    <root>/v2/<env_hash>/manifest.json           the environment identity, human-readable
+    <root>/v2/<env_hash>/<entry_hash>/kernel.o   the exported tvm-ffi object
+    <root>/v2/<env_hash>/<entry_hash>/entry.json the key and calling convention it was stored under (commit marker)
 
-- ``env_hash`` is the content hash of :func:`environment_manifest`: frontend,
-  cutlass-dsl and tvm-ffi versions, the CUDA driver, and the device's name,
+- ``env_hash`` is the content hash of :func:`environment_manifest`: frontend
+  version and a digest of the whole ``cudnn`` package's source (the shared
+  helpers a kernel imports are not in its own key; an edited checkout must
+  not hit a wheel's entries), cutlass-dsl and tvm-ffi versions, the CUDA
+  driver, and the device's name,
   compute capability, SM count and L2 size (FROST bakes the last two into
   kernels). Any change lands in a different directory; nothing is ever
   "matched approximately".
