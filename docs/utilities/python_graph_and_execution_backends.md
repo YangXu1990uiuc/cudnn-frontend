@@ -683,6 +683,70 @@ FlashInfer's graphs and buffers byte for byte and assert exactly this; a decline
 at `check_support` is reported as xfail with the row's reason, a refusal after
 acceptance fails. They are the acceptance gate for turning the opt-in rows on
 by default.
+### The compiled-plan cache
+
+`cute.compile` runs the whole backend once per process for every distinct
+kernel — 0.7 s for a FROST GEMM, 2.6 s for an SDPA prefill on SM100 — and the
+DSL's own file cache stores only MLIR bytecode, so a process that warms tens
+of plans pays minutes at start-up. `cudnn.frost.compiled_cache` keeps the
+exported tvm-ffi object of every kernel compiled with `--enable-tvm-ffi` and
+reloads it in milliseconds. `compile_cached(fn, *args, cache_key=, symbol=,
+**kwargs)` is the drop-in for `cute.compile` at a kernel's compile site. Two
+families route through it today: the GEMM templates, with the digest of their
+generated source as the key (the full GEMM suites: 5655 tests, 20:53 cold,
+1:35 warm), and the SDPA forward / backward templates, with
+`template_key(globals(), locals(), "<function>")` as the FIRST statement of
+each function that compiles — the file + params digest `template_loader`
+records as `FROST_SOURCE_DIGEST`, joined with the function's name and its
+arguments, which pin shapes, strides and flags the way the params pin dtypes
+and masks (SDPA + GEMM suites: 5867 tests, 53:06 cold, 2:53 warm). An
+argument that is not a plain value (a tensor, a device, a stream) makes the
+key None and the call compiles as before. Not cached: the linear-attention
+templates (their `compile()` takes traced tensors) and the SDPA adapters'
+helper kernels in `api_dsl`, which compile from real tensors at call time. A
+hit is the same object a miss produced, so the reloaded kernel is called
+exactly as the in-process one.
+
+The rules, borrowed from FlashInfer's autotune cache v2 so that a stale
+artifact can never be reused by accident:
+
+- **Identity is the whole manifest, hashed.** Frontend version AND a digest
+  of every `.py` in the `cudnn` package (a kernel is compiled from the shared
+  helpers it imports as much as from its template, and the version does not
+  move in a checkout someone is editing — an uncommitted edit lands in another
+  directory; a wheel hashes the same every process), cutlass-dsl and tvm-ffi
+  versions, the CUDA driver, and the device's name, compute capability, SM
+  count and L2 size (FROST bakes the last two into kernels) name the directory
+  `<root>/v2/<env_hash>/`. Any change lands elsewhere; an unreadable field is
+  hashed as `"unknown"`, never skipped.
+- **An entry is reused only under its own embedded key.** `entry.json`
+  carries the full key, symbol and signature and is compared on load; the
+  object is written first and the record after it (the commit marker), both
+  via temp file + `os.replace`, so a crash or a concurrent writer never
+  yields a loadable entry without its key.
+- **Anything doubtful is a miss**: missing, malformed, mismatched, or an
+  object `load_module` refuses (an arch the device cannot run). Never an error.
+- **A hit and a miss run the same thing.** A reloaded tvm-ffi function is
+  positional-only, so it is wrapped with the kwargs wrapper the DSL itself
+  uses, rebuilt from the RUNTIME spec the record carries (`arg_names`,
+  defaults, keyword-only names) — the Python signature minus
+  `cutlass.Constexpr` and env-stream parameters, which do not exist at run
+  time. A wrapper built from the Python signature would shift every argument
+  after a constexpr one (the fp8 SDPA kernels have one). The miss path
+  exports and then reloads, so a bad artifact fails at build time, not at the
+  next start-up. Kernels whose in-process object converts raw pointer
+  arguments, takes a dataclass argument, or has a default JSON cannot carry
+  are not persisted.
+- Location: `CUDNN_FRONTEND_COMPILED_CACHE`, else
+  `$XDG_CACHE_HOME/cudnn_frontend/compiled_plans`; `set_cache_dir()` for a
+  caller that owns a workspace (FlashInfer); `CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1`
+  turns it off; `stats()` reports hits / misses / bypassed / invalid per
+  process. Bump `_SCHEMA` on any incompatible change.
+
+Not yet routed: kernels compiled from real tensors at call time (the
+linear-attention `chunk_*` launchers, the SDPA adapters' `_dot_fn` /
+`_reduce_fn` / `_setup_fn` helpers): a key for them has to spell the traced
+tensors' dtype, rank and dynamic marks; same hook once it does.
 
 ## Key invariants
 
@@ -776,18 +840,6 @@ defaulting to device 0 is how an SM100 suite silently skips in full.
   remove `selected_engine is None` branching, lowering extracted to its own
   module, op-identity dedup (NodeType vs registry keys), longer-term a typed
   `OpSpec` as the single per-op source for builder/validation/lowering.
-- **Persistent compiled-plan cache** for the JIT engines (today `cute.compile`
-  runs once per process; only generated source is cached on disk). Mirror the
-  FlashInfer autotune-cache v2 rules: the environment identity is the content
-  hash of a manifest (frontend version, `nvidia-cutlass-dsl` version incl. its
-  `libs-core` frontend, CUDA driver version, device name + CC + SM count + L2
-  bytes — frost bakes SM count and L2 into kernels) and names the cache
-  directory; every entry embeds its own key (generated-source digest,
-  `cute.compile` options, knobs) and is verified on load; any mismatch,
-  missing or malformed file is a miss, never a partial reuse; writes are
-  temp-file + `os.replace`; an incompatible format bumps the schema directory.
-  Expose the directory / cache object so a caller (FlashInfer) can point it at
-  its own workspace and ship it in an AOT wheel.
 - SDPA forward THD: padded LSE rows of a `(b, s_max, h)` stats buffer past a
   sequence's length — the backend writes `-inf`, the python row leaves them
   unwritten (`b == 1`; at `b > 1` the form is declined) — fill for parity. The

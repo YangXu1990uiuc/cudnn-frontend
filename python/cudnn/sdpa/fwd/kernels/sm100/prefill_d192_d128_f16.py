@@ -35,6 +35,7 @@ the shared ``_common_blackwell`` / ``thd_helpers`` mechanism (same as the SM100 
 
 """
 
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 from functools import lru_cache
 from typing import Callable, NamedTuple, Optional, Tuple
 
@@ -2862,6 +2863,7 @@ def compile(  # noqa: A001
     store — the kernel body is unchanged. Constraint: every non-innermost TMA
     global stride must be a 16-byte multiple; the compact BSHD H-stride is
     d * BPE, so d must be a multiple of 8 at 2 bytes/elem."""
+    _cache_key = _template_key(globals(), locals(), "compile")
     if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
         raise ValueError(f"d192 envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
     if (d_qk * CFG.BPE) % 16 != 0 or (d_v * CFG.BPE_O) % 16 != 0:
@@ -3005,7 +3007,7 @@ def compile(  # noqa: A001
         fake_thd_q_lens = None
         fake_thd_kv_lens = None
         fake_thd_lens_form = None
-    return cute.compile(
+    return _compile_cached(
         _host,
         fake_q,
         fake_k,
@@ -3027,4 +3029,6 @@ def compile(  # noqa: A001
         *((fake_o,) if _FP32_PARTIALS else ()),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
+        cache_key=_cache_key,
+        symbol="frost_sdpa_fwd",
     )

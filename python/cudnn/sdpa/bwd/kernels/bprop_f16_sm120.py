@@ -51,6 +51,7 @@ separate ``dq2k`` kernel (``bprop_chain_f16_sm120.py``) that replaces
 not fit in device memory.
 """
 
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 from functools import lru_cache
 from types import SimpleNamespace
 from typing import Optional, Type
@@ -1493,6 +1494,7 @@ def compile(  # noqa: A001
     their declared strides as compile-time constants.
     """
 
+    _cache_key = _template_key(globals(), locals(), "compile")
     kvh = int(kvh) or int(qh)
     d_v = int(d_v) or int(d_qk)
     if qh % kvh:
@@ -1581,7 +1583,7 @@ def compile(  # noqa: A001
     fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
     options = "--enable-tvm-ffi"
 
-    compiled_dot = cute.compile(
+    compiled_dot = _compile_cached(
         dot_do_o_host,
         fake_o,
         fake_do,
@@ -1596,8 +1598,10 @@ def compile(  # noqa: A001
         bwd.deterministic,
         fake_stream,
         options=options,
+        cache_key=_cache_key,
+        symbol="frost_sdpa_bwd",
     )
-    compiled_main = cute.compile(
+    compiled_main = _compile_cached(
         bwd,
         fake_q,
         fake_k,
@@ -1618,6 +1622,8 @@ def compile(  # noqa: A001
         cutlass.Float32(1.0),
         fake_stream,
         options=options,
+        cache_key=_cache_key,
+        symbol="frost_sdpa_bwd_1",
     )
     compiled_cvt = None
     compiled_dq2k = None
@@ -1633,7 +1639,7 @@ def compile(  # noqa: A001
             ws_q_tile=bwd.q_tile,
             use_pdl=PARAMS.use_pdl,
         )
-        compiled_dq2k = cute.compile(
+        compiled_dq2k = _compile_cached(
             dq_gemm,
             fake_k,
             fake_ds_ws,
@@ -1641,9 +1647,11 @@ def compile(  # noqa: A001
             cutlass.Float32(1.0),
             fake_stream,
             options=options,
+            cache_key=_cache_key,
+            symbol="frost_sdpa_bwd_2",
         )
     else:
-        compiled_cvt = cute.compile(
+        compiled_cvt = _compile_cached(
             convert_dq_host,
             fake_dq_accum,
             fake_dq,
@@ -1656,10 +1664,12 @@ def compile(  # noqa: A001
             bwd.use_pdl,
             fake_stream,
             options=options,
+            cache_key=_cache_key,
+            symbol="frost_sdpa_bwd_3",
         )
     compiled_reduce = None
     if has_gqa:
-        compiled_reduce = cute.compile(
+        compiled_reduce = _compile_cached(
             dkv_reduce_host,
             fake_dk_ws,
             fake_dv_ws,
@@ -1672,11 +1682,13 @@ def compile(  # noqa: A001
             bwd.use_pdl,
             fake_stream,
             options=options,
+            cache_key=_cache_key,
+            symbol="frost_sdpa_bwd_4",
         )
     compiled_dbias_cvt = None
     if PARAMS.dbias_present and not PARAMS.dbias_is_fp32:
         dbias_total = bias_batch * qh * sq * skv
-        compiled_dbias_cvt = cute.compile(
+        compiled_dbias_cvt = _compile_cached(
             convert_dbias_host,
             _fake(cutlass.Float32, (dbias_total,)),
             _fake(STORAGE_DTYPE, (dbias_total,)),
@@ -1684,12 +1696,14 @@ def compile(  # noqa: A001
             bwd.use_pdl,
             fake_stream,
             options=options,
+            cache_key=_cache_key,
+            symbol="frost_sdpa_bwd_5",
         )
     compiled_dsink = None
     if PARAMS.dsink_present:
         fake_sink = _fake(cutlass.Float32, (qh,))
         fake_dsink = _fake(cutlass.Float32, (qh,))
-        compiled_dsink = cute.compile(
+        compiled_dsink = _compile_cached(
             dsink_host,
             fake_lse,
             fake_delta,
@@ -1699,6 +1713,8 @@ def compile(  # noqa: A001
             bwd.use_pdl,
             fake_stream,
             options=options,
+            cache_key=_cache_key,
+            symbol="frost_sdpa_bwd_6",
         )
     return SimpleNamespace(
         dot=compiled_dot,

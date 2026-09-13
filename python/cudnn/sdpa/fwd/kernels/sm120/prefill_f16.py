@@ -40,6 +40,7 @@ Constraints:
   capacity
 """
 
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 from functools import lru_cache, partial
 from types import SimpleNamespace
 from typing import Callable, Optional, Type
@@ -1754,6 +1755,7 @@ def compile(  # noqa: A001
     caller-declared head-row stride (``>= T``, a shape — part of the cache key).
     """
 
+    _cache_key = _template_key(globals(), locals(), "compile")
     kernel = SM120FusedMultiHeadAttentionForward(
         in_dtype=STORAGE_DTYPE,
         out_dtype=STORAGE_DTYPE,
@@ -1859,7 +1861,7 @@ def compile(  # noqa: A001
         fake_thd_q_lens = None
         fake_thd_kv_lens = None
         fake_thd_lens_form = None
-    return cute.compile(
+    return _compile_cached(
         kernel,
         fake_q,
         fake_k,
@@ -1877,4 +1879,6 @@ def compile(  # noqa: A001
         cutlass.Int32(0),  # thd_n_ctas: persistent THD grid extent (runtime)
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
+        cache_key=_cache_key,
+        symbol="frost_sdpa_fwd",
     )

@@ -41,6 +41,7 @@ them is derived from ``CFG`` rather than spelled as a literal:
 MXFP8 (block-scale) is NOT served by this file — d512 has no MXFP8 kernel.
 """
 
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 from functools import lru_cache
 from typing import Callable, Optional, Tuple
 from dataclasses import dataclass
@@ -2366,6 +2367,7 @@ def compile(  # noqa: A001
     the fake binds the token stride for the extent-1 batch dim, exactly as
     ``_thd_view`` does at runtime (``T * token_stride`` is never stepped and
     overflows the int32 stride slot on long packed KV, GitHub #980)."""
+    _cache_key = _template_key(globals(), locals(), "compile")
     if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
         raise ValueError(f"d512 envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
     if (d_qk * CFG.BPE) % 16 != 0 or (d_v * CFG.BPE_O) % 16 != 0:
@@ -2512,7 +2514,7 @@ def compile(  # noqa: A001
     fake_descale_v = _fake_scalar_f32()
     fake_scale_o = _fake_scalar_f32()
     fake_amax_o = _fake_scalar_f32()
-    return cute.compile(
+    return _compile_cached(
         _host,
         fake_q,
         fake_k,
@@ -2540,4 +2542,6 @@ def compile(  # noqa: A001
         *((fake_o,) if _FP32_PARTIALS else ()),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
+        cache_key=_cache_key,
+        symbol="frost_sdpa_fwd",
     )

@@ -21,6 +21,7 @@ plus the MXFP8 TMEM scale-factor (SF) relayout:
      one tcgen05.ld.red.f32.max for unmasked tiles.
 """
 
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 import os
 import sys
 from functools import lru_cache
@@ -2714,6 +2715,7 @@ def compile(  # noqa: A001
     ``has_lse=False`` compiles the LSE store out (the kernel specializes on a
     ``None`` LSE argument) — callers without a Stats output pass no LSE buffer
     at all; the amax_o atomicMax write is independent and unchanged."""
+    _cache_key = _template_key(globals(), locals(), "compile")
     if SPLIT_KV > 1 and not has_lse:
         # Each split's LSE is not optional under KV split — it IS the weight
         # the combine reduces with.  Without it the partials cannot be recombined.
@@ -2870,7 +2872,7 @@ def compile(  # noqa: A001
         fake_thd_q_lens = None
         fake_thd_kv_lens = None
         fake_thd_lens_form = None
-    return cute.compile(
+    return _compile_cached(
         _host,
         fake_q,
         fake_k,
@@ -2895,4 +2897,6 @@ def compile(  # noqa: A001
         *((fake_o,) if _FP32_PARTIALS else ()),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
+        cache_key=_cache_key,
+        symbol="frost_sdpa_fwd",
     )

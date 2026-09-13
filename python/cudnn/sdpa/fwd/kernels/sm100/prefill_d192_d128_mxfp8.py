@@ -22,6 +22,7 @@ plus the MXFP8 TMEM scale-factor (SF) relayout:
      one tcgen05.ld.red.f32.max for unmasked tiles.
 """
 
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 from functools import lru_cache
 from typing import Callable, NamedTuple, Optional, Tuple
 
@@ -3343,6 +3344,7 @@ def compile(  # noqa: A001
 
     THD token and scale-factor tile extents are dynamic. Split-KV stacks its
     partial O and LSE workspaces on a split-major batch axis."""
+    _cache_key = _template_key(globals(), locals(), "compile")
     if SPLIT_KV > 1 and not has_lse:
         raise ValueError("split_kv > 1 requires has_lse=True (the per-split LSE drives the combine)")
     if lse_stride is not None and (CFG.THD_VARLEN or SPLIT_KV > 1):
@@ -3472,7 +3474,7 @@ def compile(  # noqa: A001
         fake_thd_q_lens = None
         fake_thd_kv_lens = None
         fake_thd_lens_form = None
-    return cute.compile(
+    return _compile_cached(
         _host,
         fake_q,
         fake_k,
@@ -3495,4 +3497,6 @@ def compile(  # noqa: A001
         *((fake_o,) if _FP32_PARTIALS else ()),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
+        cache_key=_cache_key,
+        symbol="frost_sdpa_fwd",
     )

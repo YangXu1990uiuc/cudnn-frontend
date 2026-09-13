@@ -41,6 +41,7 @@ reason a d128 MXFP8 kernel passes with either descriptor builder.  Do not read
 this file as evidence that a V-SF builder is correct.
 """
 
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 import os
 import sys
 from functools import lru_cache
@@ -2373,6 +2374,7 @@ def compile(  # noqa: A001
     # let it fail as an arity error deep in the trace -- and so no engine row
     # can advertise thd=True for this kernel and appear to work.  The dense
     # path is unaffected: CFG.THD_VARLEN is 0 and every THD branch folds out.
+    _cache_key = _template_key(globals(), locals(), "compile")
     if CFG.THD_VARLEN:
         raise NotImplementedError(f"{__name__}: THD/varlen not ported to the FROST setup-kernel contract")
     # ---- FROST adapter ABI ------------------------------------------------
@@ -2486,7 +2488,7 @@ def compile(  # noqa: A001
         stride_order=(0,),
         assumed_align=16,
     )
-    return cute.compile(
+    return _compile_cached(
         _host,
         fake_q,
         fake_k,
@@ -2508,4 +2510,6 @@ def compile(  # noqa: A001
         cutlass.Int32(_kv_sf_tiles),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
+        cache_key=_cache_key,
+        symbol="frost_sdpa_fwd",
     )

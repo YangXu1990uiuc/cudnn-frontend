@@ -13,6 +13,7 @@ design used by the D128 FP8 sibling. Packed token totals stay dynamic and the
 setup kernel builds per-sequence O plus packed-total-clamped K/V descriptors.
 """
 
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 from functools import lru_cache
 from typing import Callable, Optional, Tuple
 
@@ -2823,6 +2824,7 @@ def compile(  # noqa: A001
     stays the compile-time TILE geometry: loads past d_qk / d_v zero-fill
     (exact zeros in the QK^T / P·V contractions), O stores past d_v clip.
     d * BPE must be a 16-byte multiple (TMA global-stride rule -> d % 8)."""
+    _cache_key = _template_key(globals(), locals(), "compile")
     if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
         raise ValueError(f"d256 envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
     if (d_qk * CFG.BPE) % 16 != 0 or (d_v * CFG.BPE_O) % 16 != 0:
@@ -2958,7 +2960,7 @@ def compile(  # noqa: A001
         fake_thd_kv_lens = None
         fake_thd_lens_form = None
 
-    return cute.compile(
+    return _compile_cached(
         _host,
         fake_q,
         fake_k,
@@ -2985,6 +2987,8 @@ def compile(  # noqa: A001
         *((fake_o,) if _FP32_PARTIALS else ()),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
+        cache_key=_cache_key,
+        symbol="frost_sdpa_fwd",
     )
 
 
