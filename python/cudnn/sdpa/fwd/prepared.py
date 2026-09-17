@@ -231,10 +231,61 @@ def _check(cond: bool, msg: str) -> None:
         raise ValueError(f"cudnn.sdpa: {msg}")
 
 
-def _capacity(f: BufferFacts, decl: tuple, name: str) -> int:
+def _capacity(f: BufferFacts, geo: Tuple[int, int, int, int], name: str) -> int:
+    """Token capacity of a packed operand under the resolved (ts, hs, es, row_span) geometry."""
     _check(f.span < 0, f"{name} was passed as a bare address; a ragged operand needs a sized buffer")
-    row, ts = decl[5], decl[2]
+    ts, row = geo[0], geo[3]
     return 0 if f.span < row else (f.span - row) // ts + 1
+
+
+class ResolvedGeometry(NamedTuple):
+    """The runtime geometry one THD call binds: the batch it runs, and per packed role the
+    (token, head, elem) strides and the row span the capacities are computed from."""
+
+    b: int
+    roles: Dict[str, Tuple[int, int, int, int]]  # name -> (ts, hs, es, row_span)
+
+
+def resolve_thd_geometry(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]]) -> ResolvedGeometry:
+    """Validate this call's effective geometry against the plan's fixed specialization and return
+    what the binder writes; raise ValueError outside the supported domain. One implementation for
+    admission and binding (no separate boolean query with its own rules).
+
+    Fixed by the artifact: head counts (GQA specialization), head dims, layout kind, page size.
+    Runtime per call: the batch (at most the declared one: workspace and unit envelope are sized
+    for it), and each packed operand's token / head strides (TMA-expressible: elem stride 1,
+    16-byte multiples, covering)."""
+    cu_q, cu_kv = bool(spec.lens_form & 1), bool(spec.lens_form & 2)
+    q_lens, kv_lens = facts.get("q_lens"), facts.get("kv_lens")
+    _check(q_lens is None or kv_lens is None, "THD execute requires seq_q_lens and seq_kv_lens")
+    b = q_lens.numel - (1 if cu_q else 0)
+    _check(b <= 0 or b > spec.b, f"seq_q_lens describes {b} sequences; this plan is prepared for 1..{spec.b}")
+    _check(kv_lens.numel != b + (1 if cu_kv else 0), f"seq_kv_lens must describe the same {b} sequences as seq_q_lens; got {kv_lens.numel} elements")
+    _check(
+        spec.has_lse and spec.lse_padded and b != spec.b, f"a per-batch padded Stats buffer is declared for {spec.b} sequences; running {b} is not supported"
+    )
+    roles: Dict[str, Tuple[int, int, int, int]] = {}
+    for name in ("q", "o") + (() if spec.paged else ("k", "v")):
+        f = facts[name]
+        decl = spec.decl[name]
+        h, d = decl[0], decl[1]
+        st, sh = f.strides, f.shape
+        if len(st) == 4:  # the graph's (B, H, S, D) declaration, possibly overridden
+            _check(int(sh[0]) != b or int(sh[1]) != h or int(sh[3]) != d, f"{name}: effective shape {tuple(sh)} must be ({b}, {h}, S, {d}) for this plan")
+            ts, hs, es = int(st[2]), int(st[1]), int(st[3])
+        elif len(st) == 3:  # the caller's packed (T, H, D)
+            _check(int(sh[1]) != h or int(sh[2]) != d, f"{name}: a packed THD buffer is (T, {h}, {d}); got {tuple(sh)}")
+            ts, hs, es = int(st[0]), int(st[1]), int(st[2])
+        else:
+            _check(True, f"{name}: a THD operand is (T, H, D) or the graph's (B, H, S, D); got rank {len(st)}")
+        if f.numel == 0:
+            ts, hs, es = decl[2], decl[3], decl[4]
+        width = _buffers.DTYPE_ITEMSIZE[spec.expect[name]]
+        _check(es != 1, f"{name}: the head dim must be contiguous (elem stride 1); got {es}")
+        _check(hs < d or (hs * width) % _ALIGN_TMA != 0, f"{name}: head stride {hs} must cover {d} elements and be a 16-byte multiple")
+        _check(ts < (h - 1) * hs + d or (ts * width) % _ALIGN_TMA != 0, f"{name}: token stride {ts} must cover the {h} heads and be a 16-byte multiple")
+        roles[name] = (ts, hs, es, (h - 1) * hs + (d - 1) * es + 1)
+    return ResolvedGeometry(b, roles)
 
 
 def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], workspace_ptr: int, stream, stream_int: int) -> Optional[List[Any]]:
@@ -251,7 +302,7 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
             f"{name}: runtime buffer is on DLPack device {f.device}; this plan executes on CUDA device {spec.device_index}",
         )
 
-    def operand(name: str, packed: bool = True) -> BufferFacts:
+    def operand(name: str) -> BufferFacts:
         f = facts.get(name)
         _check(f is None, f"{name} is required")
         _check(f.dtype != spec.expect[name], f"{name}: runtime buffer dtype {f.dtype} does not match its declaration ({spec.expect[name]})")
@@ -260,23 +311,6 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
             f.ptr % _ALIGN_TMA != 0,
             f"{name}: runtime buffer base address must be 16-byte aligned (TMA global-address rule); got data_ptr() % 16 == {f.ptr % _ALIGN_TMA}",
         )
-        if packed and f.numel > 0:
-            # Effective geometry must be the plan's declared (token, head, elem) strides: the artifact
-            # takes strides at runtime, but a THD stride override is not bound yet, so a different
-            # layout is rejected here instead of silently running on the declared one.
-            st = f.strides
-            if len(st) == 4:  # the graph's (B, H, S, D) declaration
-                eff = (int(st[2]), int(st[1]), int(st[3]))
-            elif len(st) == 3:  # the caller's packed (T, H, D)
-                eff = (int(st[0]), int(st[1]), int(st[2]))
-            else:
-                eff = None
-            _check(eff is None, f"{name}: a THD operand is (T, H, D) or the graph's (B, H, S, D); got rank {len(st)}")
-            decl = spec.decl[name]
-            _check(
-                eff != (decl[2], decl[3], decl[4]),
-                f"{name}: runtime (token, head, elem) strides {eff} differ from the plan's declared {(decl[2], decl[3], decl[4])}; THD stride override is not supported",
-            )
         return f
 
     def lens(name: str, n: int) -> int:
@@ -288,11 +322,14 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
         _check(not f.contiguous, f"{name} must be contiguous (read as a flat ({n},) operand)")
         return f.ptr
 
-    q, o = operand("q"), operand("o")
-    k, v = operand("k", packed=not spec.paged), operand("v", packed=not spec.paged)
+    q, k, v, o = operand("q"), operand("k"), operand("v"), operand("o")
+    geo = resolve_thd_geometry(spec, facts)
     frame[ix["q_ptr"]], frame[ix["k_ptr"]], frame[ix["v_ptr"]], frame[ix["o_ptr"]] = q.ptr, k.ptr, v.ptr, o.ptr
-    frame[ix["thd_q_lens_ptr"]] = lens("q_lens", spec.n_q_lens)
-    frame[ix["thd_kv_lens_ptr"]] = lens("kv_lens", spec.n_kv_lens)
+    for name, slot in (("q", "q_strides"), ("o", "o_strides")) + (() if spec.paged else (("k", "k_strides"), ("v", "v_strides"))):
+        ts, hs, _es, _row = geo.roles[name]
+        frame[ix[slot]] = (ts, ts, hs)  # the extent-1 batch dim binds the token stride (never stepped)
+    frame[ix["thd_q_lens_ptr"]] = lens("q_lens", geo.b + (1 if spec.lens_form & 1 else 0))
+    frame[ix["thd_kv_lens_ptr"]] = lens("kv_lens", geo.b + (1 if spec.lens_form & 2 else 0))
 
     lse = facts.get("lse")
     lse_cap = None
@@ -322,7 +359,7 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
         else:
             _buffers.fill_word_strided_async(lse.ptr, shape, spec.lse_stride, 4, spec.neg_inf, stream_int)
 
-    t_q = min(_capacity(q, spec.decl["q"], "q"), _capacity(o, spec.decl["o"], "o"))
+    t_q = min(_capacity(q, geo.roles["q"], "q"), _capacity(o, geo.roles["o"], "o"))
     if spec.total_q is not None:
         t_q = min(t_q, spec.total_q)
     if lse_cap is not None:
@@ -357,7 +394,7 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
         frame[ix["table_strides"]] = (int(table_strides[0]), int(table_strides[1]))
         frame[ix["n_pages"]] = int(k.shape[0])
     else:
-        t_kv = min(_capacity(k, spec.decl["k"], "k"), _capacity(v, spec.decl["v"], "v"))
+        t_kv = min(_capacity(k, geo.roles["k"], "k"), _capacity(v, geo.roles["v"], "v"))
         if spec.total_kv is not None:
             t_kv = min(t_kv, spec.total_kv)
         if t_kv == 0:
@@ -370,7 +407,7 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
             frame[ix["v_strides"]] = (kh * d_v, kh * d_v, d_v)
     if spec.has_lse and spec.lse_head_major and not spec.lse_head_stride:
         frame[ix["lse_ext"]] = t_q
-    frame[ix["problem_size"]] = (spec.b, spec.qh, spec.kh, t_q, t_kv, 0)
+    frame[ix["problem_size"]] = (geo.b, spec.qh, spec.kh, t_q, t_kv, 0)  # units / workspace are sized for spec.b >= geo.b
 
     sinks = facts.get("sinks")
     if spec.has_sink:

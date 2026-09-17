@@ -276,10 +276,10 @@ def test_bare_address_and_wrong_device_are_rejected_before_launch():
 
 @requires_pre_rubin_blackwell
 @requires_dsl
-def test_zero_kv_clamp_and_stride_mismatch():
+def test_zero_kv_clamp_and_runtime_strides():
     """All-zero KV lengths bind the V stub the spec allocated at build (no allocation, no first-use
-    initialization during execute); a THD operand whose effective strides differ from the plan's
-    declared ones is rejected before launch (stride override is not bound yet)."""
+    initialization during execute); K/V sliced from a fused slab bind their runtime token stride; a
+    layout TMA cannot express is rejected before launch."""
     b, ql, kl, hq, hk, d = 4, 4, 64, 8, 2, 128
     g, t = _thd_graph(b, ql, kl, hq, hk, d)
     ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
@@ -299,15 +299,125 @@ def test_zero_kv_clamp_and_stride_mismatch():
     frame = rec.frames[-1]
     assert frame["problem_size"][4] == 1 and frame["v_ptr"] == stub_before and frame["k_ptr"] == frame["q_ptr"]
     assert spec.dummy("v_stub") == stub_before
-    # a K with a different head stride (a (T, 2H, D) slab sliced to H heads) is a stride override: declined
-    wide_k = torch.randn(b * kl, 2 * hk, d, device=DEV, dtype=torch.bfloat16)[:, :hk]
+    # K / V sliced out of a fused (T, 2*H_kv, D) slab: a runtime token stride of 2*H_kv*D, bound as such
+    slab = torch.randn(b * kl, 2 * hk, d, device=DEV, dtype=torch.bfloat16)
+    k_view, v_view = slab[:, :hk], slab[:, hk:]
+    fused = dict(bufs, k=k_view, v=v_view)
+    fused["o"].fill_(float("nan"))
     rec = _Recorder(spec)
     try:
-        with pytest.raises(ValueError, match="stride"):
-            g.execute(_pack(t, dict(bufs, k=wide_k)), ws)
+        g.execute(_pack(t, fused), ws)
+        torch.cuda.synchronize()
+    finally:
+        rec.restore()
+    frame = rec.frames[-1]
+    assert frame["k_strides"] == (2 * hk * d, 2 * hk * d, d) and frame["v_strides"] == (2 * hk * d, 2 * hk * d, d), (frame["k_strides"], frame["v_strides"])
+    assert frame["k_ptr"] == k_view.data_ptr() and frame["v_ptr"] == v_view.data_ptr()
+    o_ref, lse_ref = _reference(dict(fused, k=k_view.contiguous(), v=v_view.contiguous()), b, ql, kl, hq, hk, d)
+    torch.testing.assert_close(fused["o"].float(), o_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(fused["lse"], lse_ref, atol=1e-3, rtol=1e-3)
+    # a head stride below the head dim is not TMA-expressible: declined before launch
+    rec = _Recorder(spec)
+    try:
+        with pytest.raises(ValueError, match="head stride"):
+            g.execute(
+                _pack(
+                    t,
+                    dict(
+                        bufs, k=torch.randn(b * kl, hk, 2 * d, device=DEV, dtype=torch.bfloat16)[:, :, :d].as_strided((b * kl, hk, d), (hk * 2 * d, d // 2, 1))
+                    ),
+                ),
+                ws,
+            )
     finally:
         rec.restore()
     assert rec.frames == []
+
+
+class _Tripwire:
+    """Fails the test if the adapter, the heuristics/lowering or the compiler is re-entered during execute."""
+
+    def __init__(self):
+        import cudnn.frost.compiled_cache as cc
+        import cudnn.sdpa.fwd.engines as eng
+        from cudnn.sdpa.fwd import api_dsl
+
+        self._targets = [(cc, "compile_cached"), (eng, "lower_dsl_prefill"), (api_dsl.SdpaFwdDslSm100, "execute"), (api_dsl.SdpaFwdDslSm100, "compile")]
+        self._saved = [(m, n, getattr(m, n)) for m, n in self._targets]
+
+    def __enter__(self):
+        for m, n, _ in self._saved:
+
+            def trip(*a, _n=n, **k):
+                raise AssertionError(f"{_n} must not run during a prepared execute")
+
+            setattr(m, n, trip)
+        return self
+
+    def __exit__(self, *exc):
+        for m, n, f in self._saved:
+            setattr(m, n, f)
+
+
+@requires_pre_rubin_blackwell
+@requires_dsl
+def test_bounded_override_through_graph_execute():
+    """The decisive case: a real shape override through public graph.execute() on the same prepared
+    artifact — fewer sequences than declared — then back to the declared geometry; the frame carries
+    the override, outputs match an independent reference, and neither the adapter, the heuristics
+    nor the compiler run. An override outside the domain (more sequences than declared) is
+    rejected before any output seed or launch."""
+    b, ql, kl, hq, hk, d = 8, 4, 64, 8, 2, 128
+    g, t = _thd_graph(b, ql, kl, hq, hk, d)
+    plan = _plan(g)
+    ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
+    spec = plan._prepared.spec
+    rec = _Recorder(spec)
+    try:
+        # declared geometry first
+        full = _buffers(b, ql, kl, hq, hk, d, seed=3)
+        with _Tripwire():
+            g.execute(_pack(t, full), ws)
+        torch.cuda.synchronize()
+        o_ref, lse_ref = _reference(full, b, ql, kl, hq, hk, d)
+        torch.testing.assert_close(full["o"].float(), o_ref, atol=2e-2, rtol=2e-2)
+        # override: b2 = 3 sequences, every per-batch / per-token operand re-described through the public API
+        b2 = 3
+        small = _buffers(b2, ql, kl, hq, hk, d, seed=4)
+        small["o"].fill_(float("nan"))
+        small["lse"].fill_(float("nan"))
+        uids = [t[n].get_uid() for n in ("q", "k", "v", "o", "stats", "cu_q", "cu_kv", "off_q", "off_kv", "off_lse")]
+        shapes = [[b2, hq, ql, d], [b2, hk, kl, d], [b2, hk, kl, d], [b2, hq, ql, d], [b2, hq, ql, 1]] + [[b2 + 1, 1, 1, 1]] * 5
+        strides = [[ql * hq * d, d, hq * d, 1], [kl * hk * d, d, hk * d, 1], [kl * hk * d, d, hk * d, 1], [ql * hq * d, d, hq * d, 1], [ql * hq, 1, hq, 1]] + [
+            [1, 1, 1, 1]
+        ] * 5
+        with _Tripwire():
+            g.execute(_pack(t, small), ws, override_uids=uids, override_shapes=shapes, override_strides=strides)
+        torch.cuda.synchronize()
+        frame = rec.frames[-1]
+        assert frame["problem_size"][0] == b2 and frame["problem_size"][3] == b2 * ql and frame["problem_size"][4] == b2 * kl, frame["problem_size"]
+        assert not torch.isnan(small["o"]).any() and not torch.isnan(small["lse"]).any()
+        o_ref, lse_ref = _reference(small, b2, ql, kl, hq, hk, d)
+        torch.testing.assert_close(small["o"].float(), o_ref, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(small["lse"], lse_ref, atol=1e-3, rtol=1e-3)
+        # back to the declared geometry on the same plan
+        again = _buffers(b, ql, kl, hq, hk, d, seed=5)
+        with _Tripwire():
+            g.execute(_pack(t, again), ws)
+        torch.cuda.synchronize()
+        assert rec.frames[-1]["problem_size"][0] == b
+        o_ref, _ = _reference(again, b, ql, kl, hq, hk, d)
+        torch.testing.assert_close(again["o"].float(), o_ref, atol=2e-2, rtol=2e-2)
+        # outside the domain: more sequences than the plan was prepared for -> rejected, no seed, no launch
+        n_before = len(rec.frames)
+        big = _buffers(b + 2, ql, kl, hq, hk, d, seed=6)
+        big["lse"].fill_(7.0)
+        shapes_big = [[b + 2, hq, ql, d], [b + 2, hk, kl, d], [b + 2, hk, kl, d], [b + 2, hq, ql, d], [b + 2, hq, ql, 1]] + [[b + 3, 1, 1, 1]] * 5
+        with pytest.raises(ValueError, match="prepared for"):
+            g.execute(_pack(t, big), ws, override_uids=uids, override_shapes=shapes_big, override_strides=strides)
+        assert len(rec.frames) == n_before and (big["lse"] == 7.0).all()
+    finally:
+        rec.restore()
 
 
 @requires_pre_rubin_blackwell
