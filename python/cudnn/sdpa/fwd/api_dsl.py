@@ -3054,8 +3054,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if workspace is not None:
             ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm100 (THD)", spec.scratch_bytes)
         else:
-            ws_ptr = spec.dummy("thd_scratch", lambda torch, dev: torch.empty(spec.scratch_bytes, dtype=torch.uint8, device=dev), current_stream)
+            ws_ptr = None
         stream_int = int(current_stream) if current_stream is not None else torch.cuda.current_stream(q_buf.device).cuda_stream
+        if ws_ptr is None:  # standalone use without a workspace: scratch owned by the spec
+            ws_ptr = spec.dummy("thd_scratch", spec.scratch_bytes, stream_int)
         frame = bind_thd(spec, facts, ws_ptr, current_stream, stream_int)
         if frame is None:
             self._logger.debug("execute (THD): no addressable Q token, nothing to do")

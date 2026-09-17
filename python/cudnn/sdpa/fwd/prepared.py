@@ -127,19 +127,15 @@ class ThdLaunchSpec:
     def frame(self) -> List[Any]:
         return list(self.template)
 
-    def dummy(self, key: str, factory, stream) -> int:
-        """Address of a read-only dummy owned by this spec, allocated once, on ``stream`` (a driver
-        CUstream or None) so first use is ordered before the kernel that reads it."""
-        t = self._dummies.get(key)
-        if t is None:
-            import torch
-
-            dev = torch.device("cuda", self.device_index)
-            ctx = torch.cuda.stream(torch.cuda.ExternalStream(int(stream), device=dev)) if stream else torch.cuda.device(dev)
-            with ctx:
-                t = factory(torch, dev)
-            self._dummies[key] = t
-        return t.data_ptr()
+    def dummy(self, key: str, nbytes: int, stream_int: int) -> int:
+        """Address of a zero-filled read-only device buffer owned by this spec (``cuMemAlloc`` on
+        the plan's device, no framework), allocated once and zeroed on ``stream_int`` so its first
+        use is ordered before the kernel that reads it."""
+        buf = self._dummies.get(key)
+        if buf is None:
+            buf = self._dummies[key] = _buffers.DeviceBuffer(int(nbytes), self.device_index)
+            _buffers.fill_word_async(buf.data_ptr(), (int(nbytes) + 3) // 4, 0, stream_int)
+        return buf.data_ptr()
 
 
 def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
@@ -323,8 +319,7 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
             t_kv = 1
             frame[ix["k_ptr"]] = q.ptr
             frame[ix["k_strides"]] = (kh * d_qk, kh * d_qk, d_qk)
-            vt = spec.expect["v"]
-            frame[ix["v_ptr"]] = spec.dummy(f"thd_v_stub_{d_v}", lambda torch, dev: torch.zeros(kh * d_v, dtype=getattr(torch, vt), device=dev), stream)
+            frame[ix["v_ptr"]] = spec.dummy(f"thd_v_stub_{d_v}", kh * d_v * _buffers.DTYPE_ITEMSIZE[spec.expect["v"]], stream_int)
             frame[ix["v_strides"]] = (kh * d_v, kh * d_v, d_v)
     if spec.has_lse and spec.lse_head_major and not spec.lse_head_stride:
         frame[ix["lse_ext"]] = t_q
@@ -337,7 +332,7 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
         frame[ix["sinks_ptr"]] = sinks.ptr
     else:
         _check(sinks is not None, "this specialization was compiled without a sink; construct the API with has_sink")
-        frame[ix["sinks_ptr"]] = spec.dummy("sinks", lambda torch, dev: torch.zeros(spec.qh, dtype=torch.float32, device=dev), stream)
+        frame[ix["sinks_ptr"]] = spec.dummy("sinks", spec.qh * 4, stream_int)
 
     _check(workspace_ptr % _ALIGN_TMA != 0, f"the workspace must be 16-byte aligned; got 0x{workspace_ptr:x}")
     frame[ix["meta_ptr"]] = workspace_ptr
