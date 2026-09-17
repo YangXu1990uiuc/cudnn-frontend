@@ -289,6 +289,35 @@ def resolve_thd_geometry(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFa
     return ResolvedGeometry(b, roles)
 
 
+def _stats_layout_is_the_compiled_kind(spec: ThdLaunchSpec, lse: BufferFacts) -> None:
+    """The host builds the Stats tensor from the compiled layout kind (token-major (T, H), head-major
+    (1, H, ext), or the declared padded strides), never from the effective strides, so an effective
+    layout that is not that kind is rejected rather than silently written in the compiled one."""
+    if lse.numel == 0:
+        return
+    st, sh = lse.strides, lse.shape
+    qh = spec.qh
+    if len(sh) == 4:  # the graph's (B, H, S, 1)
+        b_st, h_st, t_st = int(st[0]), int(st[1]), int(st[2])
+    elif len(sh) == 3:  # (B, H, S) padded, (1, H, ext) head-major, or (T, H, 1) token-major
+        b_st, h_st, t_st = int(st[0]), int(st[1]), int(st[2])
+        if not spec.lse_padded and not spec.lse_head_major:  # token-major (T, H, 1): token axis is 0
+            b_st, h_st, t_st = 0, int(st[1]), int(st[0])
+    elif len(sh) == 2:  # (T, H) token-major
+        b_st, h_st, t_st = 0, int(st[1]), int(st[0])
+    else:
+        _check(True, f"lse_tensor: unsupported Stats rank {len(sh)}")
+    if spec.lse_padded:
+        eff = (b_st, h_st, t_st)
+        _check(eff != tuple(spec.lse_stride), f"padded lse_tensor strides {eff} must be the declared {tuple(spec.lse_stride)}")
+    elif spec.lse_head_major:
+        _check(t_st != 1, f"head-major lse_tensor must have the token axis contiguous; got stride {t_st}")
+        if spec.lse_head_stride:
+            _check(h_st != spec.lse_head_stride, f"head-major lse_tensor head stride {h_st} must be the declared {spec.lse_head_stride}")
+    else:
+        _check(h_st != 1 or t_st != qh, f"token-major lse_tensor must be packed (T, H): head stride 1, token stride {qh}; got head {h_st}, token {t_st}")
+
+
 def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], workspace_ptr: int, stream, stream_int: int) -> Optional[List[Any]]:
     """This call's argument frame for ``spec`` from the operands' facts (roles ``q k v o lse sinks
     q_lens kv_lens`` and, paged, ``block_table block_table_v``); None when no Q token is
@@ -339,6 +368,7 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
         on_plan_device("lse_tensor", lse)
         _check(lse.dtype != "float32", f"lse_tensor must be float32; got {lse.dtype}")
         _check(lse.ptr % _ALIGN_F32 != 0, "lse_tensor must be 4-byte aligned")
+        _stats_layout_is_the_compiled_kind(spec, lse)
         if spec.lse_padded:
             expected = spec.b * spec.qh * spec.s_q_max
             _check(lse.numel != expected, f"padded lse_tensor must have B*H_q*S_q_max = {expected} elements; got {lse.numel}")
@@ -378,17 +408,41 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
         _check(bt.dtype != "int32" or btv.dtype != "int32", "the page tables must be int32")
         on_plan_device("paged_attention_k_table", bt)
         on_plan_device("paged_attention_v_table", btv)
+
+        def table(name, f):
+            if len(f.shape) == 4:  # the graph's (B, 1, max_pages, 1) declaration
+                shape, strides = (int(f.shape[0]), int(f.shape[2])), (int(f.strides[0]), int(f.strides[2]))
+            else:
+                shape, strides = tuple(int(x) for x in f.shape), tuple(int(x) for x in f.strides)
+            _check(len(shape) != 2, f"{name} must be (B, max_pages); got {f.shape}")
+            return shape, strides
+
+        (tb, max_pages), table_strides = table("paged_attention_k_table", bt)
+        (tbv, max_pages_v), table_strides_v = table("paged_attention_v_table", btv)
+        _check(tb < geo.b or tbv < geo.b, f"the page tables describe {tb} / {tbv} sequences; this call runs {geo.b}")
         _check(
-            bt.span >= 0 and bt.span < (bt.shape[0] * bt.shape[2] if len(bt.shape) == 4 else bt.numel),
-            "paged_attention_k_table is smaller than its declared (B, max_pages) extent",
+            max_pages_v != max_pages or table_strides_v != table_strides,
+            "paged_attention_k_table and paged_attention_v_table must share (max_pages) and strides: the host walks both with one stride pair",
         )
-        if len(bt.shape) == 4:  # the graph's (B, 1, max_pages, 1) declaration
-            table_shape = (bt.shape[0], bt.shape[2])
-            table_strides = (bt.strides[0], bt.strides[2])
-        else:
-            table_shape, table_strides = tuple(bt.shape), tuple(bt.strides)
-        _check(len(table_shape) != 2, f"the page table must be (B, max_pages); got {bt.shape}")
-        t_kv = int(table_shape[1]) * spec.page_size
+        # the host addresses rows 0..B-1 and pages 0..max_pages-1 of BOTH tables
+        need = (geo.b - 1) * table_strides[0] + (max_pages - 1) * table_strides[1] + 1
+        _check(
+            bt.span >= 0 and bt.span < need,
+            f"paged_attention_k_table spans {bt.span} elements; ({geo.b}, {max_pages}) with strides {table_strides} needs {need}",
+        )
+        _check(
+            btv.span >= 0 and btv.span < need,
+            f"paged_attention_v_table spans {btv.span} elements; ({geo.b}, {max_pages}) with strides {table_strides} needs {need}",
+        )
+        # the pools: (n_pages, KH, page_size, D) containers, head dim contiguous, one page count for K and V
+        for name, f, d in (("k", k, spec.d_qk), ("v", v, spec.d_v)):
+            _check(
+                len(f.shape) != 4 or int(f.shape[1]) != spec.kh or int(f.shape[2]) != spec.page_size or int(f.shape[3]) != d,
+                f"{name}: a page pool is (n_pages, {spec.kh}, {spec.page_size}, {d}); got {tuple(f.shape)}",
+            )
+            _check(int(f.strides[3]) != 1, f"{name}: the page pool's head dim must be contiguous")
+        _check(int(k.shape[0]) != int(v.shape[0]), f"K and V pools must hold the same number of pages; got {k.shape[0]} and {v.shape[0]}")
+        t_kv = max_pages * spec.page_size
         frame[ix["k_strides"]] = (int(k.strides[0]), int(k.strides[2]), int(k.strides[1]))
         frame[ix["v_strides"]] = (int(v.strides[0]), int(v.strides[2]), int(v.strides[1]))
         frame[ix["block_table_ptr"]], frame[ix["block_table_v_ptr"]] = bt.ptr, btv.ptr

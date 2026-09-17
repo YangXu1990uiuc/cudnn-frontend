@@ -416,6 +416,13 @@ def test_bounded_override_through_graph_execute():
         with pytest.raises(ValueError, match="prepared for"):
             g.execute(_pack(t, big), ws, override_uids=uids, override_shapes=shapes_big, override_strides=strides)
         assert len(rec.frames) == n_before and (big["lse"] == 7.0).all()
+        # the Stats layout is fixed by the artifact (token-major here): an override describing another layout is rejected
+        n_before = len(rec.frames)
+        odd = _buffers(b, ql, kl, hq, hk, d, seed=7)
+        odd["lse"].fill_(7.0)
+        with pytest.raises(ValueError, match="token-major lse_tensor"):
+            g.execute(_pack(t, odd), ws, override_uids=[t["stats"].get_uid()], override_shapes=[[b, hq, ql, 1]], override_strides=[[ql * hq, ql, 1, 1]])
+        assert len(rec.frames) == n_before and (odd["lse"] == 7.0).all()
     finally:
         rec.restore()
 
