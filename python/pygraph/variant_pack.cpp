@@ -163,7 +163,7 @@ struct Operand {
     // What the PRODUCER said about its buffer, kept apart from the effective (graph-described /
     // overridden) geometry above: the element span it guarantees addressable (-1: unknown, a bare
     // address) and its DLPack device (-1: unknown). An engine deriving a capacity reads these.
-    int64_t observed_span        = -1;
+    int64_t observed_bytes       = -1;  // producer's guaranteed span, in BYTES (its own element width)
     int32_t observed_device_type = -1;
     int32_t observed_device_id   = -1;
 };
@@ -548,8 +548,12 @@ class VariantPackNative {
             operand.stride.clear();
         }
         operand.filled = true;
-        operand.observed_span =
-            operand.stride.empty() ? numel_of(operand.shape) : span_of(operand.shape, operand.stride);
+        {
+            const int64_t elems =
+                operand.stride.empty() ? numel_of(operand.shape) : span_of(operand.shape, operand.stride);
+            const int64_t bytes    = (static_cast<int64_t>(t.dtype.bits) * t.dtype.lanes + 7) / 8;
+            operand.observed_bytes = elems * bytes;
+        }
         operand.observed_device_type = static_cast<int32_t>(t.device.device_type);
         operand.observed_device_id   = t.device.device_id;
         pointers_[index]             = operand.data;
@@ -596,11 +600,11 @@ class VariantPackNative {
                 int dtype_code,
                 int dtype_bits,
                 int dtype_lanes          = 1,
-                int64_t observed_span    = -1,
+                int64_t observed_bytes   = -1,
                 int observed_device_type = -1,
                 int observed_device_id   = -1) {
         Operand &operand             = operands_.at(index);
-        operand.observed_span        = observed_span;
+        operand.observed_bytes       = observed_bytes;
         operand.observed_device_type = observed_device_type;
         operand.observed_device_id   = observed_device_id;
         operand.data                 = reinterpret_cast<void *>(ptr);
@@ -755,10 +759,10 @@ class VariantPackNative {
         return reinterpret_cast<int64_t>(pointers_.at(index));
     }
 
-    // The producer's guaranteed element span (-1 unknown) and DLPack (device_type, device_id) (-1, -1 unknown).
+    // The producer's guaranteed span in BYTES (-1 unknown) and DLPack (device_type, device_id) (-1, -1 unknown).
     int64_t
-    observed_span(size_t index) const {
-        return operands_.at(index).observed_span;
+    observed_bytes(size_t index) const {
+        return operands_.at(index).observed_bytes;
     }
 
     std::pair<int32_t, int32_t>
@@ -1041,7 +1045,7 @@ its parts.
              py::arg("dtype_code"),
              py::arg("dtype_bits"),
              py::arg("dtype_lanes")          = 1,
-             py::arg("observed_span")        = -1,
+             py::arg("observed_bytes")       = -1,
              py::arg("observed_device_type") = -1,
              py::arg("observed_device_id")   = -1)
         .def("override_operand",
@@ -1057,7 +1061,7 @@ its parts.
         .def("operand_contiguous", &VariantPackNative::operand_contiguous)
         .def("is_filled", &VariantPackNative::is_filled)
         .def("pointer", &VariantPackNative::pointer)
-        .def("observed_span", &VariantPackNative::observed_span)
+        .def("observed_bytes", &VariantPackNative::observed_bytes)
         .def("observed_device", &VariantPackNative::observed_device)
         .def("shape", &VariantPackNative::shape)
         .def("stride", &VariantPackNative::stride)

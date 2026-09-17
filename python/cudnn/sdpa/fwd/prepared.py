@@ -42,7 +42,7 @@ class BufferFacts(NamedTuple):
     ptr: int
     dtype: str  # bare name ("bfloat16"); "" when unknown
     device: Tuple[int, int]  # DLPack (device_type, device_id); (-1, -1) unknown
-    span: int  # element span the producer guarantees; -1 unknown (a bare address)
+    span: int  # element span the producer guarantees, in the DECLARED element width; -1 unknown (a bare address)
     shape: Tuple[int, ...]
     strides: Tuple[int, ...]
 
@@ -76,11 +76,14 @@ def facts_of_pack(pack, index: int) -> BufferFacts:
     """Facts of variant-pack operand ``index``: the producer's observed span / device, the
     effective (graph-described, overridden) geometry; no operand object is built."""
     native = pack.native
+    code_bits = tuple(native.dtype(index))
+    nbytes = native.observed_bytes(index)
+    width = max(1, (int(code_bits[1]) + 7) // 8) if len(code_bits) == 2 else 1
     return BufferFacts(
         native.pointer(index),
-        _DTYPE_BY_CODE.get(tuple(native.dtype(index)), ""),
+        _DTYPE_BY_CODE.get(code_bits, ""),
         tuple(native.observed_device(index)),
-        native.observed_span(index),
+        -1 if nbytes < 0 else nbytes // width,  # producer bytes -> elements of the EFFECTIVE (declared) dtype
         tuple(native.shape(index)),
         tuple(native.stride(index)),
     )
@@ -127,15 +130,25 @@ class ThdLaunchSpec:
     def frame(self) -> List[Any]:
         return list(self.template)
 
-    def dummy(self, key: str, nbytes: int, stream_int: int) -> int:
-        """Address of a zero-filled read-only device buffer owned by this spec (``cuMemAlloc`` on
-        the plan's device, no framework), allocated once and zeroed on ``stream_int`` so its first
-        use is ordered before the kernel that reads it."""
-        buf = self._dummies.get(key)
-        if buf is None:
-            buf = self._dummies[key] = _buffers.DeviceBuffer(int(nbytes), self.device_index)
-            _buffers.fill_word_async(buf.data_ptr(), (int(nbytes) + 3) // 4, 0, stream_int)
-        return buf.data_ptr()
+    def dummy(self, key: str) -> int:
+        """Address of a zero-filled read-only device buffer owned by this spec; every one the frame can
+        need is allocated and initialized at build (:func:`build_thd_spec`), never during execute."""
+        return self._dummies[key].data_ptr()
+
+
+def _zeroed_device_buffer(nbytes: int, device_index: int) -> "_buffers.DeviceBuffer":
+    """A ``cuMemAlloc`` buffer zeroed synchronously (cuMemsetD32 + stream sync at build): ready for
+    whatever stream later reads it."""
+    from cuda.bindings import driver as _drv
+
+    buf = _buffers.DeviceBuffer(int(nbytes), device_index)
+    (err,) = _drv.cuMemsetD32(buf.data_ptr(), 0, (int(nbytes) + 3) // 4)
+    if int(err) != 0:
+        raise RuntimeError(f"cudnn.sdpa: cuMemsetD32 failed: {err}")
+    (err,) = _drv.cuStreamSynchronize(_drv.CUstream(0))
+    if int(err) != 0:
+        raise RuntimeError(f"cudnn.sdpa: cuStreamSynchronize failed: {err}")
+    return buf
 
 
 def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
@@ -176,6 +189,10 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     s.neg_inf = _buffers.init_word("fp32", float("-inf"))
     s.device_index = int(api.q_desc.device.index or 0)
     s._dummies = {}
+    if not s.has_sink:
+        s._dummies["sinks"] = _zeroed_device_buffer(s.qh * 4, s.device_index)
+    if not s.paged:  # the all-KV-zero clamp's V stub: one (kh, d_v) row of zeros
+        s._dummies["v_stub"] = _zeroed_device_buffer(s.kh * s.d_v * _buffers.DTYPE_ITEMSIZE[s.expect["v"]], s.device_index)
     scale = float(api.scale_softmax if scale_softmax is None or scale_softmax == 0.0 else scale_softmax)
 
     t: List[Any] = [None] * len(order)
@@ -227,7 +244,7 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
     ix = spec.index
     frame = spec.frame()
 
-    def operand(name: str) -> BufferFacts:
+    def operand(name: str, packed: bool = True) -> BufferFacts:
         f = facts.get(name)
         _check(f is None, f"{name} is required")
         _check(f.dtype != spec.expect[name], f"{name}: runtime buffer dtype {f.dtype} does not match its declaration ({spec.expect[name]})")
@@ -239,6 +256,23 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
             f.ptr % _ALIGN_TMA != 0,
             f"{name}: runtime buffer base address must be 16-byte aligned (TMA global-address rule); got data_ptr() % 16 == {f.ptr % _ALIGN_TMA}",
         )
+        if packed and f.numel > 0:
+            # Effective geometry must be the plan's declared (token, head, elem) strides: the artifact
+            # takes strides at runtime, but a THD stride override is not bound yet, so a different
+            # layout is rejected here instead of silently running on the declared one.
+            st = f.strides
+            if len(st) == 4:  # the graph's (B, H, S, D) declaration
+                eff = (int(st[2]), int(st[1]), int(st[3]))
+            elif len(st) == 3:  # the caller's packed (T, H, D)
+                eff = (int(st[0]), int(st[1]), int(st[2]))
+            else:
+                eff = None
+            _check(eff is None, f"{name}: a THD operand is (T, H, D) or the graph's (B, H, S, D); got rank {len(st)}")
+            decl = spec.decl[name]
+            _check(
+                eff != (decl[2], decl[3], decl[4]),
+                f"{name}: runtime (token, head, elem) strides {eff} differ from the plan's declared {(decl[2], decl[3], decl[4])}; THD stride override is not supported",
+            )
         return f
 
     def lens(name: str, n: int) -> int:
@@ -249,7 +283,8 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
         _check(not f.contiguous, f"{name} must be contiguous (read as a flat ({n},) operand)")
         return f.ptr
 
-    q, k, v, o = operand("q"), operand("k"), operand("v"), operand("o")
+    q, o = operand("q"), operand("o")
+    k, v = operand("k", packed=not spec.paged), operand("v", packed=not spec.paged)
     frame[ix["q_ptr"]], frame[ix["k_ptr"]], frame[ix["v_ptr"]], frame[ix["o_ptr"]] = q.ptr, k.ptr, v.ptr, o.ptr
     frame[ix["thd_q_lens_ptr"]] = lens("q_lens", spec.n_q_lens)
     frame[ix["thd_kv_lens_ptr"]] = lens("kv_lens", spec.n_kv_lens)
@@ -319,7 +354,7 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
             t_kv = 1
             frame[ix["k_ptr"]] = q.ptr
             frame[ix["k_strides"]] = (kh * d_qk, kh * d_qk, d_qk)
-            frame[ix["v_ptr"]] = spec.dummy(f"thd_v_stub_{d_v}", kh * d_v * _buffers.DTYPE_ITEMSIZE[spec.expect["v"]], stream_int)
+            frame[ix["v_ptr"]] = spec.dummy("v_stub")
             frame[ix["v_strides"]] = (kh * d_v, kh * d_v, d_v)
     if spec.has_lse and spec.lse_head_major and not spec.lse_head_stride:
         frame[ix["lse_ext"]] = t_q
@@ -332,7 +367,7 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
         frame[ix["sinks_ptr"]] = sinks.ptr
     else:
         _check(sinks is not None, "this specialization was compiled without a sink; construct the API with has_sink")
-        frame[ix["sinks_ptr"]] = spec.dummy("sinks", spec.qh * 4, stream_int)
+        frame[ix["sinks_ptr"]] = spec.dummy("sinks")
 
     _check(workspace_ptr % _ALIGN_TMA != 0, f"the workspace must be 16-byte aligned; got 0x{workspace_ptr:x}")
     frame[ix["meta_ptr"]] = workspace_ptr

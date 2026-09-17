@@ -69,6 +69,18 @@ def _observed_span(data) -> Optional[int]:
     return 1 + sum((int(size) - 1) * int(stride) for size, stride in zip(shape, strides))
 
 
+def _producer_itemsize(data, declared_data_type) -> int:
+    """Bytes per element of the caller's buffer as the caller types it; the declaration's slot width when the producer does not say."""
+    es = getattr(data, "element_size", None)
+    if callable(es):
+        try:
+            return int(es())
+        except TypeError:
+            pass
+    slot = storage_slot_bytes(declared_data_type)
+    return int(slot) if slot else 1
+
+
 def _in_axis_order_of(shape, stride, reference_stride):
     """``(shape, stride)`` re-expressed in the axis order ``reference_stride`` uses.
 
@@ -2032,6 +2044,8 @@ class pygraph:
                 from_graph.append(i)
             ptr, tensor = self._describe(data, order[i])
             span = _observed_span(data)
+            if span is not None:  # bytes, in the PRODUCER's element width (the description below may re-type the slot)
+                span = span * _producer_itemsize(data, tensor.data_type)
             dev = getattr(data, "device", None)
             dev_type, dev_id = (2, int(dev.index or 0)) if dev is not None and getattr(dev, "type", "") == "cuda" else (-1, -1)
             native.set_operand(

@@ -3056,8 +3056,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         else:
             ws_ptr = None
         stream_int = int(current_stream) if current_stream is not None else torch.cuda.current_stream(q_buf.device).cuda_stream
-        if ws_ptr is None:  # standalone use without a workspace: scratch owned by the spec
-            ws_ptr = spec.dummy("thd_scratch", spec.scratch_bytes, stream_int)
+        if ws_ptr is None:
+            # standalone use without a workspace: GPU-written scratch is per INVOCATION (never shared
+            # through the spec), allocated on the launch stream as _thd_pack did
+            with _torch_stream_context(current_stream, q_buf.device):
+                scratch = torch.empty(spec.scratch_bytes, dtype=torch.uint8, device=q_buf.device)
+            ws_ptr = scratch.data_ptr()
         frame = bind_thd(spec, facts, ws_ptr, current_stream, stream_int)
         if frame is None:
             self._logger.debug("execute (THD): no addressable Q token, nothing to do")

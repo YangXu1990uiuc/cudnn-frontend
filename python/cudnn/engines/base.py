@@ -207,11 +207,11 @@ class VariantPack:
     def ptr(self, tensor_or_uid) -> int:
         return self.native.pointer(self.index_of(tensor_or_uid))
 
-    def observed_span(self, index: int) -> int:
-        """Element span the PRODUCER guarantees for operand ``index`` (-1: unknown, a bare address),
-        recorded at normalization and untouched by graph re-description or overrides. An engine
-        deriving a capacity (THD token extents) reads this, never the effective geometry."""
-        return self.native.observed_span(index)
+    def observed_bytes(self, index: int) -> int:
+        """Bytes the PRODUCER guarantees addressable for operand ``index`` (-1: unknown, a bare address),
+        recorded at normalization in the producer's own element width and untouched by graph
+        re-description or overrides. An engine deriving a capacity divides by ITS element size."""
+        return self.native.observed_bytes(index)
 
     def observed_device(self, index: int):
         """The producer's DLPack ``(device_type, device_id)`` for operand ``index``; ``(-1, -1)`` unknown."""

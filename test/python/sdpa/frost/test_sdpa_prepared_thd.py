@@ -272,7 +272,46 @@ def test_bare_address_and_wrong_device_are_rejected_before_launch():
 
 @requires_pre_rubin_blackwell
 @requires_dsl
+def test_zero_kv_clamp_and_stride_mismatch():
+    """All-zero KV lengths bind the V stub the spec allocated at build (no allocation, no first-use
+    initialization during execute); a THD operand whose effective strides differ from the plan's
+    declared ones is rejected before launch (stride override is not bound yet)."""
+    b, ql, kl, hq, hk, d = 4, 4, 64, 8, 2, 128
+    g, t = _thd_graph(b, ql, kl, hq, hk, d)
+    ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
+    bufs = _buffers(b, ql, kl, hq, hk, d)
+    spec = _plan(g)._prepared.spec
+    assert "v_stub" in spec._dummies and "sinks" in spec._dummies, "resources exist before the first execute"
+    stub_before = spec.dummy("v_stub")
+    rec = _Recorder(spec)
+    try:
+        zero_kv = dict(bufs, k=torch.empty(0, hk, d, device=DEV, dtype=torch.bfloat16), v=torch.empty(0, hk, d, device=DEV, dtype=torch.bfloat16))
+        zero_kv["cu_kv"] = torch.zeros(b + 1, device=DEV, dtype=torch.int32)
+        zero_kv["off_kv"] = torch.zeros(b + 1, device=DEV, dtype=torch.int32)
+        g.execute(_pack(t, zero_kv), ws)
+        torch.cuda.synchronize()
+    finally:
+        rec.restore()
+    frame = rec.frames[-1]
+    assert frame["problem_size"][4] == 1 and frame["v_ptr"] == stub_before and frame["k_ptr"] == frame["q_ptr"]
+    assert spec.dummy("v_stub") == stub_before
+    # a K with a different head stride (a (T, 2H, D) slab sliced to H heads) is a stride override: declined
+    wide_k = torch.randn(b * kl, 2 * hk, d, device=DEV, dtype=torch.bfloat16)[:, :hk]
+    rec = _Recorder(spec)
+    try:
+        with pytest.raises(ValueError, match="stride"):
+            g.execute(_pack(t, dict(bufs, k=wide_k)), ws)
+    finally:
+        rec.restore()
+    assert rec.frames == []
+
+
+@requires_pre_rubin_blackwell
+@requires_dsl
 def test_execute_allocates_nothing_and_never_synchronizes():
+    """Warmed-path check: after one execute, further executes add no torch allocation and trigger no
+    torch-visible synchronization. Driver-side allocation is excluded by construction (the spec
+    allocates its resources at build; see test_zero_kv_clamp_and_stride_mismatch)."""
     b, ql, kl, hq, hk, d = 4, 4, 64, 8, 2, 128
     g, t = _thd_graph(b, ql, kl, hq, hk, d)
     ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
