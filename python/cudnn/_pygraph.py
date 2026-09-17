@@ -2047,7 +2047,9 @@ class pygraph:
             if span is not None:  # bytes, in the PRODUCER's element width (the description below may re-type the slot)
                 span = span * _producer_itemsize(data, tensor.data_type)
             dev = getattr(data, "device", None)
-            dev_type, dev_id = (2, int(dev.index or 0)) if dev is not None and getattr(dev, "type", "") == "cuda" else (-1, -1)
+            dev_type, dev_id = (-1, -1)
+            if dev is not None and getattr(dev, "type", None) is not None:  # a torch-like device: CUDA (2) or CPU (1); unknown stays -1
+                dev_type, dev_id = (2, int(dev.index or 0)) if dev.type == "cuda" else (1, 0)
             native.set_operand(
                 i,
                 ptr,

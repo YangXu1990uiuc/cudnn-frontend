@@ -33,6 +33,7 @@ from cudnn.frost.compiled_cache import positional_entry
 _ALIGN_TMA = 16
 _ALIGN_F32 = 4
 _KDLCUDA = 2
+_KDLCPU = 1
 _DTYPE_BY_CODE = {(code, bits): name for name, (code, bits) in _buffers.DTYPES.items()}
 
 
@@ -68,7 +69,7 @@ def facts_of_tensor(t) -> Optional[BufferFacts]:
         n *= int(e)
     span = n if (n == 0 or t.is_contiguous()) else 1 + sum((int(s) - 1) * int(st) for s, st in zip(shape, strides))
     dev = t.device
-    device = (_KDLCUDA, int(dev.index if dev.index is not None else 0)) if dev.type == "cuda" else (-1, -1)
+    device = (_KDLCUDA, int(dev.index if dev.index is not None else 0)) if dev.type == "cuda" else (_KDLCPU, 0)  # a known CPU tensor is not "unknown"
     return BufferFacts(t.data_ptr(), str(t.dtype).split(".")[-1], device, span, shape, strides)
 
 
@@ -299,7 +300,7 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
         # one device rule for every bound role: a KNOWN producer device must be the plan's CUDA device
         _check(
             f.device[0] != -1 and f.device != (_KDLCUDA, spec.device_index),
-            f"{name}: runtime buffer is on DLPack device {f.device}; this plan executes on CUDA device {spec.device_index}",
+            f"{name} must be on CUDA device {spec.device_index} (this plan's); got DLPack device {f.device}",
         )
 
     def operand(name: str) -> BufferFacts:
