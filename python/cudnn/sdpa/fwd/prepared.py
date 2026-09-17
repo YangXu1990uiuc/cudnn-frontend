@@ -238,14 +238,10 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     return s
 
 
-def _check(cond: bool, msg: str) -> None:
-    if cond:
-        raise ValueError(f"cudnn.sdpa: {msg}")
-
-
 def _capacity(f: BufferFacts, geo: Tuple[int, int, int, int], name: str) -> int:
     """Token capacity of a packed operand under the resolved (ts, hs, es, row_span) geometry."""
-    _check(f.span < 0, f"{name} was passed as a bare address; a ragged operand needs a sized buffer")
+    if f.span < 0:
+        raise ValueError(f"cudnn.sdpa: " + (f"{name} was passed as a bare address; a ragged operand needs a sized buffer"))
     ts, row = geo[0], geo[3]
     return 0 if f.span < row else (f.span - row) // ts + 1
 
@@ -269,13 +265,15 @@ def resolve_thd_geometry(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFa
     16-byte multiples, covering)."""
     cu_q, cu_kv = bool(spec.lens_form & 1), bool(spec.lens_form & 2)
     q_lens, kv_lens = facts.get("q_lens"), facts.get("kv_lens")
-    _check(q_lens is None or kv_lens is None, "THD execute requires seq_q_lens and seq_kv_lens")
+    if q_lens is None or kv_lens is None:
+        raise ValueError(f"cudnn.sdpa: " + ("THD execute requires seq_q_lens and seq_kv_lens"))
     b = q_lens.numel - (1 if cu_q else 0)
-    _check(b <= 0 or b > spec.b, f"seq_q_lens describes {b} sequences; this plan is prepared for 1..{spec.b}")
-    _check(kv_lens.numel != b + (1 if cu_kv else 0), f"seq_kv_lens must describe the same {b} sequences as seq_q_lens; got {kv_lens.numel} elements")
-    _check(
-        spec.has_lse and spec.lse_padded and b != spec.b, f"a per-batch padded Stats buffer is declared for {spec.b} sequences; running {b} is not supported"
-    )
+    if b <= 0 or b > spec.b:
+        raise ValueError(f"cudnn.sdpa: " + (f"seq_q_lens describes {b} sequences; this plan is prepared for 1..{spec.b}"))
+    if kv_lens.numel != b + (1 if cu_kv else 0):
+        raise ValueError(f"cudnn.sdpa: " + (f"seq_kv_lens must describe the same {b} sequences as seq_q_lens; got {kv_lens.numel} elements"))
+    if spec.has_lse and spec.lse_padded and b != spec.b:
+        raise ValueError(f"cudnn.sdpa: " + (f"a per-batch padded Stats buffer is declared for {spec.b} sequences; running {b} is not supported"))
     roles: Dict[str, Tuple[int, int, int, int]] = {}
     for name in ("q", "o") + (() if spec.paged else ("k", "v")):
         f = facts[name]
@@ -283,19 +281,25 @@ def resolve_thd_geometry(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFa
         h, d = decl[0], decl[1]
         st, sh = f.strides, f.shape
         if len(st) == 4:  # the graph's (B, H, S, D) declaration, possibly overridden
-            _check(int(sh[0]) != b or int(sh[1]) != h or int(sh[3]) != d, f"{name}: effective shape {tuple(sh)} must be ({b}, {h}, S, {d}) for this plan")
+            if int(sh[0]) != b or int(sh[1]) != h or int(sh[3]) != d:
+                raise ValueError(f"cudnn.sdpa: " + (f"{name}: effective shape {tuple(sh)} must be ({b}, {h}, S, {d}) for this plan"))
             ts, hs, es = int(st[2]), int(st[1]), int(st[3])
         elif len(st) == 3:  # the caller's packed (T, H, D)
-            _check(int(sh[1]) != h or int(sh[2]) != d, f"{name}: a packed THD buffer is (T, {h}, {d}); got {tuple(sh)}")
+            if int(sh[1]) != h or int(sh[2]) != d:
+                raise ValueError(f"cudnn.sdpa: " + (f"{name}: a packed THD buffer is (T, {h}, {d}); got {tuple(sh)}"))
             ts, hs, es = int(st[0]), int(st[1]), int(st[2])
         else:
-            _check(True, f"{name}: a THD operand is (T, H, D) or the graph's (B, H, S, D); got rank {len(st)}")
+            if True:
+                raise ValueError(f"cudnn.sdpa: " + (f"{name}: a THD operand is (T, H, D) or the graph's (B, H, S, D); got rank {len(st)}"))
         if f.numel == 0:
             ts, hs, es = decl[2], decl[3], decl[4]
         width = _buffers.DTYPE_ITEMSIZE[spec.expect[name]]
-        _check(es != 1, f"{name}: the head dim must be contiguous (elem stride 1); got {es}")
-        _check(hs < d or (hs * width) % _ALIGN_TMA != 0, f"{name}: head stride {hs} must cover {d} elements and be a 16-byte multiple")
-        _check(ts < (h - 1) * hs + d or (ts * width) % _ALIGN_TMA != 0, f"{name}: token stride {ts} must cover the {h} heads and be a 16-byte multiple")
+        if es != 1:
+            raise ValueError(f"cudnn.sdpa: " + (f"{name}: the head dim must be contiguous (elem stride 1); got {es}"))
+        if hs < d or (hs * width) % _ALIGN_TMA != 0:
+            raise ValueError(f"cudnn.sdpa: " + (f"{name}: head stride {hs} must cover {d} elements and be a 16-byte multiple"))
+        if ts < (h - 1) * hs + d or (ts * width) % _ALIGN_TMA != 0:
+            raise ValueError(f"cudnn.sdpa: " + (f"{name}: token stride {ts} must cover the {h} heads and be a 16-byte multiple"))
         roles[name] = (ts, hs, es, (h - 1) * hs + (d - 1) * es + 1)
     return ResolvedGeometry(b, roles)
 
@@ -317,16 +321,23 @@ def _stats_layout_is_the_compiled_kind(spec: ThdLaunchSpec, lse: BufferFacts) ->
     elif len(sh) == 2:  # (T, H) token-major
         b_st, h_st, t_st = 0, int(st[1]), int(st[0])
     else:
-        _check(True, f"lse_tensor: unsupported Stats rank {len(sh)}")
+        if True:
+            raise ValueError(f"cudnn.sdpa: " + (f"lse_tensor: unsupported Stats rank {len(sh)}"))
     if spec.lse_padded:
         eff = (b_st, h_st, t_st)
-        _check(eff != tuple(spec.lse_stride), f"padded lse_tensor strides {eff} must be the declared {tuple(spec.lse_stride)}")
+        if eff != tuple(spec.lse_stride):
+            raise ValueError(f"cudnn.sdpa: " + (f"padded lse_tensor strides {eff} must be the declared {tuple(spec.lse_stride)}"))
     elif spec.lse_head_major:
-        _check(t_st != 1, f"head-major lse_tensor must have the token axis contiguous; got stride {t_st}")
+        if t_st != 1:
+            raise ValueError(f"cudnn.sdpa: " + (f"head-major lse_tensor must have the token axis contiguous; got stride {t_st}"))
         if spec.lse_head_stride:
-            _check(h_st != spec.lse_head_stride, f"head-major lse_tensor head stride {h_st} must be the declared {spec.lse_head_stride}")
+            if h_st != spec.lse_head_stride:
+                raise ValueError(f"cudnn.sdpa: " + (f"head-major lse_tensor head stride {h_st} must be the declared {spec.lse_head_stride}"))
     else:
-        _check(h_st != 1 or t_st != qh, f"token-major lse_tensor must be packed (T, H): head stride 1, token stride {qh}; got head {h_st}, token {t_st}")
+        if h_st != 1 or t_st != qh:
+            raise ValueError(
+                f"cudnn.sdpa: " + (f"token-major lse_tensor must be packed (T, H): head stride 1, token stride {qh}; got head {h_st}, token {t_st}")
+            )
 
 
 def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], workspace_ptr: int, stream, stream_int: int) -> Optional[List[Any]]:
@@ -338,29 +349,34 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
 
     def on_plan_device(name: str, f: BufferFacts) -> None:
         # one device rule for every bound role: a KNOWN producer device must be the plan's CUDA device
-        _check(
-            f.device[0] != -1 and f.device != (_KDLCUDA, spec.device_index),
-            f"{name} must be on CUDA device {spec.device_index} (this plan's); got DLPack device {f.device}",
-        )
+        if f.device[0] != -1 and f.device != (_KDLCUDA, spec.device_index):
+            raise ValueError(f"cudnn.sdpa: " + (f"{name} must be on CUDA device {spec.device_index} (this plan's); got DLPack device {f.device}"))
 
     def operand(name: str) -> BufferFacts:
         f = facts.get(name)
-        _check(f is None, f"{name} is required")
-        _check(f.dtype != spec.expect[name], f"{name}: runtime buffer dtype {f.dtype} does not match its declaration ({spec.expect[name]})")
+        if f is None:
+            raise ValueError(f"cudnn.sdpa: " + (f"{name} is required"))
+        if f.dtype != spec.expect[name]:
+            raise ValueError(f"cudnn.sdpa: " + (f"{name}: runtime buffer dtype {f.dtype} does not match its declaration ({spec.expect[name]})"))
         on_plan_device(name, f)
-        _check(
-            f.ptr % _ALIGN_TMA != 0,
-            f"{name}: runtime buffer base address must be 16-byte aligned (TMA global-address rule); got data_ptr() % 16 == {f.ptr % _ALIGN_TMA}",
-        )
+        if f.ptr % _ALIGN_TMA != 0:
+            raise ValueError(
+                f"cudnn.sdpa: "
+                + (f"{name}: runtime buffer base address must be 16-byte aligned (TMA global-address rule); got data_ptr() % 16 == {f.ptr % _ALIGN_TMA}")
+            )
         return f
 
     def lens(name: str, n: int) -> int:
         f = facts.get(name)
-        _check(f is None, f"{name} is required")
+        if f is None:
+            raise ValueError(f"cudnn.sdpa: " + (f"{name} is required"))
         on_plan_device(name, f)
-        _check(f.dtype != "int32", f"{name} must be int32; got {f.dtype}")
-        _check(f.numel != n, f"{name} must have {n} elements; got {f.numel}")
-        _check(not f.contiguous, f"{name} must be contiguous (read as a flat ({n},) operand)")
+        if f.dtype != "int32":
+            raise ValueError(f"cudnn.sdpa: " + (f"{name} must be int32; got {f.dtype}"))
+        if f.numel != n:
+            raise ValueError(f"cudnn.sdpa: " + (f"{name} must have {n} elements; got {f.numel}"))
+        if not f.contiguous:
+            raise ValueError(f"cudnn.sdpa: " + (f"{name} must be contiguous (read as a flat ({n},) operand)"))
         return f.ptr
 
     q, k, v, o = operand("q"), operand("k"), operand("v"), operand("o")
@@ -375,24 +391,29 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
     lse = facts.get("lse")
     lse_cap = None
     if spec.has_lse:
-        _check(lse is None, "lse_tensor is required by this compiled specialization")
+        if lse is None:
+            raise ValueError(f"cudnn.sdpa: " + ("lse_tensor is required by this compiled specialization"))
         on_plan_device("lse_tensor", lse)
-        _check(lse.dtype != "float32", f"lse_tensor must be float32; got {lse.dtype}")
-        _check(lse.ptr % _ALIGN_F32 != 0, "lse_tensor must be 4-byte aligned")
-        _stats_layout_is_the_compiled_kind(spec, lse)
+        if lse.dtype != "float32":
+            raise ValueError(f"cudnn.sdpa: " + (f"lse_tensor must be float32; got {lse.dtype}"))
+        if lse.ptr % _ALIGN_F32 != 0:
+            raise ValueError(f"cudnn.sdpa: " + ("lse_tensor must be 4-byte aligned"))
         if spec.lse_padded:
             expected = spec.b * spec.qh * spec.s_q_max
-            _check(lse.numel != expected, f"padded lse_tensor must have B*H_q*S_q_max = {expected} elements; got {lse.numel}")
+            if lse.numel != expected:
+                raise ValueError(f"cudnn.sdpa: " + (f"padded lse_tensor must have B*H_q*S_q_max = {expected} elements; got {lse.numel}"))
         elif spec.lse_head_major and spec.lse_head_stride:
-            _check(
-                lse.numel < spec.qh * spec.lse_head_stride,
-                f"head-major lse_tensor must hold H_q*head_stride = {spec.qh * spec.lse_head_stride} elements; got {lse.numel}",
-            )
+            if lse.numel < spec.qh * spec.lse_head_stride:
+                raise ValueError(
+                    f"cudnn.sdpa: " + (f"head-major lse_tensor must hold H_q*head_stride = {spec.qh * spec.lse_head_stride} elements; got {lse.numel}")
+                )
         else:
             lse_cap = (lse.numel if lse.span < 0 else lse.span) // spec.qh
+        _stats_layout_is_the_compiled_kind(spec, lse)  # after the size checks: a mis-sized buffer reports its size, not its layout
         frame[ix["lse_ptr"]] = lse.ptr
     else:
-        _check(lse is not None, "this specialization was compiled without a Stats output; construct the API without sample_lse")
+        if lse is not None:
+            raise ValueError(f"cudnn.sdpa: " + ("this specialization was compiled without a Stats output; construct the API without sample_lse"))
 
     def seed_padded():
         shape = (spec.b, spec.qh, spec.s_q_max)
@@ -415,8 +436,10 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
         # K/V are page pools (n_pages, page_size, KH, D) in the kernel's order: a permutation of the
         # container's (n_pages, KH, page_size, D) strides; SKV = max_pages * page_size
         bt, btv = facts.get("block_table"), facts.get("block_table_v")
-        _check(bt is None or btv is None, "paged KV requires paged_attention_k_table / paged_attention_v_table buffers")
-        _check(bt.dtype != "int32" or btv.dtype != "int32", "the page tables must be int32")
+        if bt is None or btv is None:
+            raise ValueError(f"cudnn.sdpa: " + ("paged KV requires paged_attention_k_table / paged_attention_v_table buffers"))
+        if bt.dtype != "int32" or btv.dtype != "int32":
+            raise ValueError(f"cudnn.sdpa: " + ("the page tables must be int32"))
         on_plan_device("paged_attention_k_table", bt)
         on_plan_device("paged_attention_v_table", btv)
 
@@ -425,34 +448,37 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
                 shape, strides = (int(f.shape[0]), int(f.shape[2])), (int(f.strides[0]), int(f.strides[2]))
             else:
                 shape, strides = tuple(int(x) for x in f.shape), tuple(int(x) for x in f.strides)
-            _check(len(shape) != 2, f"{name} must be (B, max_pages); got {f.shape}")
+            if len(shape) != 2:
+                raise ValueError(f"cudnn.sdpa: " + (f"{name} must be (B, max_pages); got {f.shape}"))
             return shape, strides
 
         (tb, max_pages), table_strides = table("paged_attention_k_table", bt)
         (tbv, max_pages_v), table_strides_v = table("paged_attention_v_table", btv)
-        _check(tb < geo.b or tbv < geo.b, f"the page tables describe {tb} / {tbv} sequences; this call runs {geo.b}")
-        _check(
-            max_pages_v != max_pages or table_strides_v != table_strides,
-            "paged_attention_k_table and paged_attention_v_table must share (max_pages) and strides: the host walks both with one stride pair",
-        )
+        if tb < geo.b or tbv < geo.b:
+            raise ValueError(f"cudnn.sdpa: " + (f"the page tables describe {tb} / {tbv} sequences; this call runs {geo.b}"))
+        if max_pages_v != max_pages or table_strides_v != table_strides:
+            raise ValueError(
+                f"cudnn.sdpa: "
+                + ("paged_attention_k_table and paged_attention_v_table must share (max_pages) and strides: the host walks both with one stride pair")
+            )
         # the host addresses rows 0..B-1 and pages 0..max_pages-1 of BOTH tables
         need = (geo.b - 1) * table_strides[0] + (max_pages - 1) * table_strides[1] + 1
-        _check(
-            bt.span >= 0 and bt.span < need,
-            f"paged_attention_k_table spans {bt.span} elements; ({geo.b}, {max_pages}) with strides {table_strides} needs {need}",
-        )
-        _check(
-            btv.span >= 0 and btv.span < need,
-            f"paged_attention_v_table spans {btv.span} elements; ({geo.b}, {max_pages}) with strides {table_strides} needs {need}",
-        )
+        if bt.span >= 0 and bt.span < need:
+            raise ValueError(
+                f"cudnn.sdpa: " + (f"paged_attention_k_table spans {bt.span} elements; ({geo.b}, {max_pages}) with strides {table_strides} needs {need}")
+            )
+        if btv.span >= 0 and btv.span < need:
+            raise ValueError(
+                f"cudnn.sdpa: " + (f"paged_attention_v_table spans {btv.span} elements; ({geo.b}, {max_pages}) with strides {table_strides} needs {need}")
+            )
         # the pools: (n_pages, KH, page_size, D) containers, head dim contiguous, one page count for K and V
         for name, f, d in (("k", k, spec.d_qk), ("v", v, spec.d_v)):
-            _check(
-                len(f.shape) != 4 or int(f.shape[1]) != spec.kh or int(f.shape[2]) != spec.page_size or int(f.shape[3]) != d,
-                f"{name}: a page pool is (n_pages, {spec.kh}, {spec.page_size}, {d}); got {tuple(f.shape)}",
-            )
-            _check(int(f.strides[3]) != 1, f"{name}: the page pool's head dim must be contiguous")
-        _check(int(k.shape[0]) != int(v.shape[0]), f"K and V pools must hold the same number of pages; got {k.shape[0]} and {v.shape[0]}")
+            if len(f.shape) != 4 or int(f.shape[1]) != spec.kh or int(f.shape[2]) != spec.page_size or int(f.shape[3]) != d:
+                raise ValueError(f"cudnn.sdpa: " + (f"{name}: a page pool is (n_pages, {spec.kh}, {spec.page_size}, {d}); got {tuple(f.shape)}"))
+            if int(f.strides[3]) != 1:
+                raise ValueError(f"cudnn.sdpa: " + (f"{name}: the page pool's head dim must be contiguous"))
+        if int(k.shape[0]) != int(v.shape[0]):
+            raise ValueError(f"cudnn.sdpa: " + (f"K and V pools must hold the same number of pages; got {k.shape[0]} and {v.shape[0]}"))
         t_kv = max_pages * spec.page_size
         frame[ix["k_strides"]] = (int(k.strides[0]), int(k.strides[2]), int(k.strides[1]))
         frame[ix["v_strides"]] = (int(v.strides[0]), int(v.strides[2]), int(v.strides[1]))
@@ -477,15 +503,19 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
 
     sinks = facts.get("sinks")
     if spec.has_sink:
-        _check(sinks is None, "sinks is required by this compiled specialization")
+        if sinks is None:
+            raise ValueError(f"cudnn.sdpa: " + ("sinks is required by this compiled specialization"))
         on_plan_device("sinks", sinks)
-        _check(sinks.dtype != "float32" or sinks.numel != spec.qh or not sinks.contiguous, f"sinks must be a contiguous ({spec.qh},) float32 tensor")
+        if sinks.dtype != "float32" or sinks.numel != spec.qh or not sinks.contiguous:
+            raise ValueError(f"cudnn.sdpa: " + (f"sinks must be a contiguous ({spec.qh},) float32 tensor"))
         frame[ix["sinks_ptr"]] = sinks.ptr
     else:
-        _check(sinks is not None, "this specialization was compiled without a sink; construct the API with has_sink")
+        if sinks is not None:
+            raise ValueError(f"cudnn.sdpa: " + ("this specialization was compiled without a sink; construct the API with has_sink"))
         frame[ix["sinks_ptr"]] = spec.dummy("sinks")
 
-    _check(workspace_ptr % _ALIGN_TMA != 0, f"the workspace must be 16-byte aligned; got 0x{workspace_ptr:x}")
+    if workspace_ptr % _ALIGN_TMA != 0:
+        raise ValueError(f"cudnn.sdpa: " + (f"the workspace must be 16-byte aligned; got 0x{workspace_ptr:x}"))
     frame[ix["meta_ptr"]] = workspace_ptr
     frame[ix["o_desc_ptr"]] = workspace_ptr + spec.off_o_desc
     frame[ix["stream"]] = stream
