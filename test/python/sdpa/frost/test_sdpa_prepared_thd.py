@@ -265,6 +265,10 @@ def test_bare_address_and_wrong_device_are_rejected_before_launch():
             g.execute(_pack(t, dict(bufs, q=bufs["q"].data_ptr())), ws)
         with pytest.raises((ValueError, RuntimeError, TypeError)):
             g.execute(_pack(t, dict(bufs, k=bufs["k"].cpu())), ws)
+        with pytest.raises((ValueError, RuntimeError, TypeError)):  # auxiliary roles carry the same device rule
+            g.execute(_pack(t, dict(bufs, cu_q=bufs["cu_q"].cpu())), ws)
+        with pytest.raises((ValueError, RuntimeError, TypeError)):
+            g.execute(_pack(t, dict(bufs, lse=bufs["lse"].cpu())), ws)
     finally:
         rec.restore()
     assert rec.frames == [], "a rejected call must not reach the launch"

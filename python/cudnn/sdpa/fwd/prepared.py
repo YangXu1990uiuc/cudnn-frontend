@@ -244,14 +244,18 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
     ix = spec.index
     frame = spec.frame()
 
-    def operand(name: str, packed: bool = True) -> BufferFacts:
-        f = facts.get(name)
-        _check(f is None, f"{name} is required")
-        _check(f.dtype != spec.expect[name], f"{name}: runtime buffer dtype {f.dtype} does not match its declaration ({spec.expect[name]})")
+    def on_plan_device(name: str, f: BufferFacts) -> None:
+        # one device rule for every bound role: a KNOWN producer device must be the plan's CUDA device
         _check(
             f.device[0] != -1 and f.device != (_KDLCUDA, spec.device_index),
             f"{name}: runtime buffer is on DLPack device {f.device}; this plan executes on CUDA device {spec.device_index}",
         )
+
+    def operand(name: str, packed: bool = True) -> BufferFacts:
+        f = facts.get(name)
+        _check(f is None, f"{name} is required")
+        _check(f.dtype != spec.expect[name], f"{name}: runtime buffer dtype {f.dtype} does not match its declaration ({spec.expect[name]})")
+        on_plan_device(name, f)
         _check(
             f.ptr % _ALIGN_TMA != 0,
             f"{name}: runtime buffer base address must be 16-byte aligned (TMA global-address rule); got data_ptr() % 16 == {f.ptr % _ALIGN_TMA}",
@@ -278,6 +282,7 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
     def lens(name: str, n: int) -> int:
         f = facts.get(name)
         _check(f is None, f"{name} is required")
+        on_plan_device(name, f)
         _check(f.dtype != "int32", f"{name} must be int32; got {f.dtype}")
         _check(f.numel != n, f"{name} must have {n} elements; got {f.numel}")
         _check(not f.contiguous, f"{name} must be contiguous (read as a flat ({n},) operand)")
@@ -293,6 +298,7 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
     lse_cap = None
     if spec.has_lse:
         _check(lse is None, "lse_tensor is required by this compiled specialization")
+        on_plan_device("lse_tensor", lse)
         _check(lse.dtype != "float32", f"lse_tensor must be float32; got {lse.dtype}")
         _check(lse.ptr % _ALIGN_F32 != 0, "lse_tensor must be 4-byte aligned")
         if spec.lse_padded:
@@ -332,6 +338,12 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
         bt, btv = facts.get("block_table"), facts.get("block_table_v")
         _check(bt is None or btv is None, "paged KV requires paged_attention_k_table / paged_attention_v_table buffers")
         _check(bt.dtype != "int32" or btv.dtype != "int32", "the page tables must be int32")
+        on_plan_device("paged_attention_k_table", bt)
+        on_plan_device("paged_attention_v_table", btv)
+        _check(
+            bt.span >= 0 and bt.span < (bt.shape[0] * bt.shape[2] if len(bt.shape) == 4 else bt.numel),
+            "paged_attention_k_table is smaller than its declared (B, max_pages) extent",
+        )
         if len(bt.shape) == 4:  # the graph's (B, 1, max_pages, 1) declaration
             table_shape = (bt.shape[0], bt.shape[2])
             table_strides = (bt.strides[0], bt.strides[2])
@@ -363,6 +375,7 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
     sinks = facts.get("sinks")
     if spec.has_sink:
         _check(sinks is None, "sinks is required by this compiled specialization")
+        on_plan_device("sinks", sinks)
         _check(sinks.dtype != "float32" or sinks.numel != spec.qh or not sinks.contiguous, f"sinks must be a contiguous ({spec.qh},) float32 tensor")
         frame[ix["sinks_ptr"]] = sinks.ptr
     else:
