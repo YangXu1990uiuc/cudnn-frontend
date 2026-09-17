@@ -1051,10 +1051,6 @@ class SdpaFwdDsl(APIBase):
             raise ValueError(f"cudnn.sdpa: {label} workspace must be at least 16-byte aligned; got data_ptr=0x{base:x}")
         return base
 
-    def _thd_kernel(self, clamped_kv: bool):
-        """The plan-time THD artifact; the all-KV-zero clamp (``_thd_pack``) only changes runtime extents."""
-        return self._compiled_kernel
-
     def _amax_slot(self, tensor, name: str, device: torch.device) -> torch.Tensor:
         """The caller's 1-element amax storage, or a cached dummy.
 
@@ -2240,6 +2236,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # execute() only binds pointers. has_lse=False compiles the LSE store out; a split
         # requires the in-kernel LSE (the per-split LSE is the combine weight).
         self._compiled_kernel = self._k_mod.compile(**self._explicit_compile_kwargs())
+        self._build_thd_spec()
         self._combine_kernel = None
         # What the combine's amax slot is COMPILED for.  Under a split the main
         # kernel never writes an amax itself (the combine owns it), so folding
@@ -2259,10 +2256,19 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._compile_combine()
         self._logger.debug("compile completed")
 
-    def _prepared_launch_supported(self) -> bool:
-        """Whether the lowering may build a :class:`cudnn.sdpa.fwd.prepared.PreparedThdLaunch` for this plan:
-        the packed (THD) f16 / bf16 forward on an explicit-ABI template, unpaged, no split."""
-        return bool(self.thd and not self.paged and not self._fp8 and self.split_kv == 1 and getattr(self._k_mod, "EXPLICIT_ABI", False))
+    def _build_thd_spec(self) -> None:
+        """The THD f16 / bf16 launch, prepared once (``cudnn.sdpa.fwd.prepared``): the graph plan and
+        ``execute()`` both bind through it. None outside its domain (quantized, split, an artifact
+        without a positional entry), where the tensor-argument path still serves."""
+        self._thd_spec = None
+        if not (self.thd and not self._fp8 and self.split_kv == 1 and getattr(self._k_mod, "EXPLICIT_ABI", False)):
+            return
+        from cudnn.sdpa.fwd.prepared import build_thd_spec
+
+        try:
+            self._thd_spec = build_thd_spec(self, scale_softmax=None)
+        except NotImplementedError as exc:
+            self._logger.debug("prepared THD launch unavailable (%s); executing through the tensor-argument path", exc)
 
     @property
     def _explicit_abi(self) -> bool:
@@ -2302,59 +2308,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             kw["has_amax"] = self.has_amax_o
         self._host_params = frozenset(inspect.signature(km._host).parameters)
         return kw
-
-    def _launch_thd_explicit(self, fn, pack, lse_tensor, scale_softmax_log2, stream, block_table, block_table_v) -> None:
-        """THD launch of an explicit-ABI template: pointers plus the packed totals,
-        the declared (batch, seq, head) strides and the Stats layout constants."""
-        st = self._k_mod.STORAGE_DTYPE
-        f32, i32, i64 = cutlass.Float32, cutlass.Int32, cutlass.Int64
-        P = self._ptr
-        Q, K, V, O = pack.Q, pack.K, pack.V, pack.O
-        if self.paged:
-            # pools in the kernel's [page, row, head, d] order; SKV = max_pages * page_size
-            skv, n_pages = block_table.shape[1] * self.paged_page_size, K.shape[0]
-            k_st, v_st = (K.stride[0], K.stride[1], K.stride[2]), (V.stride[0], V.stride[1], V.stride[2])
-            bt, btv, t_st = P(i32, block_table, 4), P(i32, block_table_v, 4), (block_table.stride(0), block_table.stride(1))
-        else:
-            skv, n_pages = pack.t_kv, 0
-            k_st, v_st = (K.stride[0], K.stride[1], K.stride[2]), (V.stride[0], V.stride[1], V.stride[2])
-            bt, btv, t_st = None, None, (0, 0)
-        lse_st, lse_ext = (0, 0, 0), 0
-        if lse_tensor is not None:
-            if self.thd_stats_padded:
-                lse_st, lse_ext = tuple(self._lse_stride), self.s_q_max
-            elif self.thd_stats_head_major:
-                lse_ext = self.thd_stats_head_stride or pack.t_q
-        kw = dict(
-            q_ptr=P(st, Q),
-            k_ptr=P(st, K),
-            v_ptr=P(st, V),
-            o_ptr=P(st, O),
-            lse_ptr=P(f32, lse_tensor, 4),
-            sinks_ptr=P(f32, pack.sinks_t),
-            meta_ptr=P(i32, pack.meta),
-            o_desc_ptr=P(i64, pack.o_desc),
-            problem_size=(self.batch_size, self.h_q, self.h_kv, pack.t_q, skv, 0),
-            q_strides=(Q.stride[0], Q.stride[1], Q.stride[2]),
-            k_strides=k_st,
-            v_strides=v_st,
-            o_strides=(O.stride[0], O.stride[1], O.stride[2]),
-            lse_strides=lse_st,
-            lse_ext=lse_ext,
-            scale_softmax_log2=scale_softmax_log2,
-            n_thd_units=pack.units,
-            seq_q_lens_addr=0,  # dense-only
-            thd_q_lens_ptr=P(i32, pack.q_lens_dev, 4),
-            thd_kv_lens_ptr=P(i32, pack.kv_lens_dev, 4),
-            thd_lens_form=pack.lens_form,
-            o_partial_ptr=None,  # split is dense-only
-            block_table_ptr=bt,
-            block_table_v_ptr=btv,
-            table_strides=t_st,
-            n_pages=n_pages,
-        )
-        params = self._host_params
-        fn(**{name: value for name, value in kw.items() if name in params}, stream=stream)
 
     def _launch_quant_explicit(
         self,
@@ -3081,19 +3034,35 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         execute is fully async and CUDA-graph capturable. No compile is keyed
         on runtime data: the kernels compile with DYNAMIC token extents, so a
         new packed total re-binds the same artifact."""
-        lse_cap = self._thd_lse_tokens_cap(lse_tensor)
-        pack = self._thd_pack(
-            q_buf, k_buf, v_buf, o_buf, sinks, seq_len_kv, seq_q_lens, workspace, "SdpaFwdDslSm100 (THD)", current_stream=current_stream, lse_tokens_cap=lse_cap
+        from cudnn.sdpa.fwd.prepared import bind_thd, facts_of_tensor
+
+        spec = self._thd_spec
+        if spec is None:
+            raise NotImplementedError("SdpaFwdDslSm100 (THD): this plan has no prepared launch (see _build_thd_spec)")
+        facts = dict(
+            q=facts_of_tensor(q_buf),
+            k=facts_of_tensor(k_buf),
+            v=facts_of_tensor(v_buf),
+            o=facts_of_tensor(o_buf),
+            lse=facts_of_tensor(lse_tensor),
+            sinks=facts_of_tensor(sinks),
+            q_lens=facts_of_tensor(seq_q_lens),
+            kv_lens=facts_of_tensor(seq_len_kv),
+            block_table=facts_of_tensor(block_table),
+            block_table_v=facts_of_tensor(block_table_v),
         )
-        if pack is None:
+        if workspace is not None:
+            ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm100 (THD)", spec.scratch_bytes)
+        else:
+            ws_ptr = spec.dummy("thd_scratch", lambda torch, dev: torch.empty(spec.scratch_bytes, dtype=torch.uint8, device=dev), current_stream)
+        stream_int = int(current_stream) if current_stream is not None else torch.cuda.current_stream(q_buf.device).cuda_stream
+        frame = bind_thd(spec, facts, ws_ptr, current_stream, stream_int)
+        if frame is None:
             self._logger.debug("execute (THD): no addressable Q token, nothing to do")
-            # no addressable Q token: every padded Stats row is unwritten, and the contract is -inf on all of them
-            self._seed_padded_lse(self._thd_padded_lse_view(lse_tensor), current_stream)
             return
-        LSE = self._thd_lse_operand(lse_tensor, pack.t_q)
-        fn = self._thd_kernel(pack.clamped_kv)
-        self._seed_padded_lse(LSE, current_stream)
-        self._launch_thd_explicit(fn, pack, lse_tensor, scale_softmax_log2, current_stream, block_table, block_table_v)
+        if scale_softmax_log2 != spec.template[spec.index["scale_softmax_log2"]]:
+            frame[spec.index["scale_softmax_log2"]] = scale_softmax_log2
+        spec.fn(*frame)
         self._logger.debug("execute (THD) completed")
         return
 
