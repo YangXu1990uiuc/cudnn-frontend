@@ -147,17 +147,13 @@ class VariantPack:
     pointers — silently, because every pointer in it is individually valid.
     """
 
-    __slots__ = ("uids", "native", "_index_of", "workspace", "workspace_bytes", "_device", "graph_described", "observed_span")
+    __slots__ = ("uids", "native", "_index_of", "workspace", "workspace_bytes", "_device", "graph_described")
 
-    def __init__(self, uids, native, workspace_ptr: int = 0, workspace_bytes: int = 0, graph_described=(), observed_span=None):
+    def __init__(self, uids, native, workspace_ptr: int = 0, workspace_bytes: int = 0, graph_described=()):
         self.uids = uids
         self.native = native
         self.workspace = workspace_ptr
         self.workspace_bytes = workspace_bytes
-        # {slot: element span of the CALLER's buffer} for the graph_described slots: their native
-        # description is the graph's, whose ragged span says nothing about the buffer; an engine
-        # deriving a capacity (THD token extents) reads the producer's own span here.
-        self.observed_span = observed_span or {}
         # Slots whose dim/stride were lent by the graph because the caller
         # passed a bare address. Usually empty. An engine that reads extents by
         # axis position needs this: the graph and the caller order a matmul's B
@@ -210,6 +206,16 @@ class VariantPack:
 
     def ptr(self, tensor_or_uid) -> int:
         return self.native.pointer(self.index_of(tensor_or_uid))
+
+    def observed_span(self, index: int) -> int:
+        """Element span the PRODUCER guarantees for operand ``index`` (-1: unknown, a bare address),
+        recorded at normalization and untouched by graph re-description or overrides. An engine
+        deriving a capacity (THD token extents) reads this, never the effective geometry."""
+        return self.native.observed_span(index)
+
+    def observed_device(self, index: int):
+        """The producer's DLPack ``(device_type, device_id)`` for operand ``index``; ``(-1, -1)`` unknown."""
+        return self.native.observed_device(index)
 
     def operands(self, indices):
         """The buffers for ``indices``, in one crossing."""

@@ -2031,7 +2031,20 @@ class pygraph:
                 # slot that borrowed one is named here.
                 from_graph.append(i)
             ptr, tensor = self._describe(data, order[i])
-            native.set_operand(i, ptr, tuple(tensor.dim), tuple(tensor.stride), *_dlpack_code_bits(tensor.data_type), _dlpack_lanes(tensor.data_type))
+            span = _observed_span(data)
+            dev = getattr(data, "device", None)
+            dev_type, dev_id = (2, int(dev.index or 0)) if dev is not None and getattr(dev, "type", "") == "cuda" else (-1, -1)
+            native.set_operand(
+                i,
+                ptr,
+                tuple(tensor.dim),
+                tuple(tensor.stride),
+                *_dlpack_code_bits(tensor.data_type),
+                _dlpack_lanes(tensor.data_type),
+                -1 if span is None else span,
+                dev_type,
+                dev_id,
+            )
         if strict:
             hole = native.first_unfilled()
             if hole >= 0:
@@ -2050,11 +2063,6 @@ class pygraph:
         # its own description; the engine decides. The rule runs natively, one
         # crossing per pack: this is on every execute's critical path.
         from_graph.extend(native.describe_from(self._declared_layout(order), from_graph))
-        observed = {}
-        for i in from_graph:
-            span = _observed_span(uid_to_data.get(order[i]))
-            if span is not None:
-                observed[i] = span
         if override_uids:
             # The backend refuses a partial override; a short list must not
             # quietly mean "keep the rest" here.
@@ -2093,7 +2101,7 @@ class pygraph:
                 workspace_bytes = _byte_size(workspace_tensor)
             else:
                 workspace_ptr, workspace_bytes = extent
-        return VariantPack(tuple(order), native, workspace_ptr, workspace_bytes, tuple(from_graph), observed)
+        return VariantPack(tuple(order), native, workspace_ptr, workspace_bytes, tuple(from_graph))
 
     def _declared_layout(self, order: List[int]):
         """The storage-slot geometry each slot of ``order`` was declared with,

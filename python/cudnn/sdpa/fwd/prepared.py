@@ -25,24 +25,6 @@ _ALIGN_TMA = 16
 _ALIGN_F32 = 4
 
 
-def _span(op) -> int:
-    """Element span of an operand: ``1 + sum((size - 1) * stride)`` (numel when compact)."""
-    n = op.numel()
-    if n == 0:
-        return 0
-    shape, strides = tuple(op.shape), tuple(op.stride())
-    if _buffers.is_contiguous(shape, strides):
-        return n
-    return 1 + sum((int(size) - 1) * int(stride) for size, stride in zip(shape, strides))
-
-
-def _capacity(op, decl: tuple) -> int:
-    """Token capacity of a THD operand under its declared strides (see ``SdpaFwdDsl._capacity``)."""
-    span = _span(op)
-    row, ts = decl[5], decl[2]
-    return 0 if span < row else (span - row) // ts + 1
-
-
 def _dtype_name(op) -> str:
     return str(op.dtype).split(".")[-1]
 
@@ -184,9 +166,12 @@ class PreparedThdLaunch:
             raise ValueError(f"{name} must be contiguous (read as a flat ({n},) operand)")
         return op.data_ptr()
 
-    def _operand(self, op, name: str) -> int:
+    def _operand(self, op, name: str, pack, index: int) -> int:
         if _dtype_name(op) != self._expect[name]:
             raise ValueError(f"{name}: runtime buffer dtype {op.dtype} does not match its declaration ({self._expect[name]})")
+        dev_type, dev_id = pack.observed_device(index)
+        if dev_type != -1 and (dev_type != 2 or dev_id != pack.device):  # kDLCUDA == 2
+            raise ValueError(f"{name}: runtime buffer is on DLPack device ({dev_type}, {dev_id}); this plan executes on CUDA device {pack.device}")
         ptr = op.data_ptr()
         if ptr % _ALIGN_TMA != 0:
             raise ValueError(
@@ -204,27 +189,23 @@ class PreparedThdLaunch:
     def execute(self, pack, workspace_ptr: int, stream, stream_int: int) -> None:
         indices = self._indices or self._resolve(pack)
         ops = dict(zip(self._uid_names, pack.operands(indices)))
-        observed = pack.observed_span if pack.graph_described else None
 
-        def cap(name, op, decl):
-            if observed is not None:
-                span = observed.get(indices[self._slot[name]], -1)
-                if span == -1:
-                    span = _span(op)
-                elif span is None:
-                    raise ValueError(f"cudnn.sdpa: {name} was passed as a bare address; a ragged operand needs a sized buffer")
-                row, ts = decl[5], decl[2]
-                return 0 if span < row else (span - row) // ts + 1
-            return _capacity(op, decl)
+        def cap(name, decl):
+            # the producer's span, never the effective (graph-described / overridden) geometry
+            span = pack.observed_span(indices[self._slot[name]])
+            if span < 0:
+                raise ValueError(f"cudnn.sdpa: {name} was passed as a bare address; a ragged operand needs a sized buffer")
+            row, ts = decl[5], decl[2]
+            return 0 if span < row else (span - row) // ts + 1
 
         plan = self._plan
         frame = list(self._template)
         q, k, v, o = ops["q"], ops["k"], ops["v"], ops["o"]
         lse = ops.get("lse")
-        frame[self._i_ptr["q"]] = self._operand(q, "q")
-        frame[self._i_ptr["k"]] = self._operand(k, "k")
-        frame[self._i_ptr["v"]] = self._operand(v, "v")
-        frame[self._i_ptr["o"]] = self._operand(o, "o")
+        frame[self._i_ptr["q"]] = self._operand(q, "q", pack, indices[self._slot["q"]])
+        frame[self._i_ptr["k"]] = self._operand(k, "k", pack, indices[self._slot["k"]])
+        frame[self._i_ptr["v"]] = self._operand(v, "v", pack, indices[self._slot["v"]])
+        frame[self._i_ptr["o"]] = self._operand(o, "o", pack, indices[self._slot["o"]])
         frame[self._i_q_lens] = self._lens(ops["q_lens"], "cu_seq_len_q" if plan.lens_form & 1 else "seq_q_lens", plan.n_q_lens)
         frame[self._i_kv_lens] = self._lens(ops["kv_lens"], "cu_seq_len_kv" if plan.lens_form & 2 else "seq_kv_lens", plan.n_kv_lens)
 
@@ -244,11 +225,11 @@ class PreparedThdLaunch:
                 if lse.numel() < self._qh * self._lse_head_stride:
                     raise ValueError(f"head-major lse_tensor must hold H_q*head_stride = {self._qh * self._lse_head_stride} elements; got {lse.numel()}")
             else:
-                span = observed.get(indices[self._slot["lse"]], -1) if observed is not None else -1
-                lse_cap = (lse.numel() if span == -1 else (span or 0)) // self._qh
+                span = pack.observed_span(indices[self._slot["lse"]])
+                lse_cap = (lse.numel() if span < 0 else span) // self._qh
         frame[self._i_ptr["lse"]] = lse_ptr
 
-        t_q = min(cap("q", q, plan.q), cap("o", o, plan.o))
+        t_q = min(cap("q", plan.q), cap("o", plan.o))
         if self._total_q is not None:
             t_q = min(t_q, self._total_q)
         if lse_cap is not None:
@@ -257,7 +238,7 @@ class PreparedThdLaunch:
             if lse_ptr is not None and self._lse_padded:
                 self._seed_padded(lse_ptr, stream_int)
             return  # no addressable Q token: nothing to launch
-        t_kv = min(cap("k", k, plan.k), cap("v", v, plan.v))
+        t_kv = min(cap("k", plan.k), cap("v", plan.v))
         if self._total_kv is not None:
             t_kv = min(t_kv, self._total_kv)
         if t_kv == 0:
