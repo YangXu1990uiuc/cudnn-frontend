@@ -306,38 +306,40 @@ def resolve_thd_geometry(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFa
 
 def _stats_layout_is_the_compiled_kind(spec: ThdLaunchSpec, lse: BufferFacts) -> None:
     """The host builds the Stats tensor from the compiled layout kind (token-major (T, H), head-major
-    (1, H, ext), or the declared padded strides), never from the effective strides, so an effective
-    layout that is not that kind is rejected rather than silently written in the compiled one."""
+    (1, H, ext), or the declared padded strides), never from the effective strides. Compact storage of
+    rank <= 2 carries no layout that could contradict the kind (the kind is how that storage is written;
+    this is what the tensor path bound too); a described rank-3 / rank-4 geometry must be the kind."""
     if lse.numel == 0:
         return
     st, sh = lse.strides, lse.shape
     qh = spec.qh
-    if len(sh) == 4:  # the graph's (B, H, S, 1)
-        b_st, h_st, t_st = int(st[0]), int(st[1]), int(st[2])
-    elif len(sh) == 3:  # (B, H, S) padded, (1, H, ext) head-major, or (T, H, 1) token-major
-        b_st, h_st, t_st = int(st[0]), int(st[1]), int(st[2])
-        if not spec.lse_padded and not spec.lse_head_major:  # token-major (T, H, 1): token axis is 0
-            b_st, h_st, t_st = 0, int(st[1]), int(st[0])
-    elif len(sh) == 2:  # (T, H) token-major
-        b_st, h_st, t_st = 0, int(st[1]), int(st[0])
-    else:
-        if True:
-            raise ValueError(f"cudnn.sdpa: " + (f"lse_tensor: unsupported Stats rank {len(sh)}"))
     if spec.lse_padded:
-        eff = (b_st, h_st, t_st)
-        if eff != tuple(spec.lse_stride):
-            raise ValueError(f"cudnn.sdpa: " + (f"padded lse_tensor strides {eff} must be the declared {tuple(spec.lse_stride)}"))
-    elif spec.lse_head_major:
-        if t_st != 1:
-            raise ValueError(f"cudnn.sdpa: " + (f"head-major lse_tensor must have the token axis contiguous; got stride {t_st}"))
-        if spec.lse_head_stride:
-            if h_st != spec.lse_head_stride:
-                raise ValueError(f"cudnn.sdpa: " + (f"head-major lse_tensor head stride {h_st} must be the declared {spec.lse_head_stride}"))
+        if len(sh) == 4 or len(sh) == 3:
+            eff = (int(st[0]), int(st[1]), int(st[2]))
+            if eff != tuple(spec.lse_stride):
+                raise ValueError(f"cudnn.sdpa: padded lse_tensor strides {eff} must be the declared {tuple(spec.lse_stride)}")
+        elif not lse.contiguous or tuple(spec.lse_stride) != (qh * spec.s_q_max, spec.s_q_max, 1):
+            raise ValueError(f"cudnn.sdpa: padded lse_tensor of shape {tuple(sh)} does not carry the declared strides {tuple(spec.lse_stride)}")
+        return
+    if len(sh) <= 2 and lse.contiguous:
+        return  # flat (T*H) or (T, H) / (H, ext) storage: written in the compiled kind
+    if len(sh) == 4:  # the graph's (B, H, S, 1)
+        h_st, t_st = int(st[1]), int(st[2])
+    elif len(sh) == 3 and spec.lse_head_major:  # (1, H, ext)
+        h_st, t_st = int(st[1]), int(st[2])
+    elif len(sh) == 3:  # (T, H, 1) token-major
+        h_st, t_st = int(st[1]), int(st[0])
+    elif len(sh) == 2:  # strided (T, H) / (H, ext)
+        h_st, t_st = (int(st[0]), int(st[1])) if spec.lse_head_major else (int(st[1]), int(st[0]))
     else:
-        if h_st != 1 or t_st != qh:
-            raise ValueError(
-                f"cudnn.sdpa: " + (f"token-major lse_tensor must be packed (T, H): head stride 1, token stride {qh}; got head {h_st}, token {t_st}")
-            )
+        raise ValueError(f"cudnn.sdpa: lse_tensor: unsupported Stats geometry {tuple(sh)} / {tuple(st)}")
+    if spec.lse_head_major:
+        if t_st != 1:
+            raise ValueError(f"cudnn.sdpa: head-major lse_tensor must have the token axis contiguous; got stride {t_st}")
+        if spec.lse_head_stride and h_st != spec.lse_head_stride:
+            raise ValueError(f"cudnn.sdpa: head-major lse_tensor head stride {h_st} must be the declared {spec.lse_head_stride}")
+    elif h_st != 1 or t_st != qh:
+        raise ValueError(f"cudnn.sdpa: token-major lse_tensor must be packed (T, H): head stride 1, token stride {qh}; got head {h_st}, token {t_st}")
 
 
 def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], workspace_ptr: int, stream, stream_int: int) -> Optional[List[Any]]:
