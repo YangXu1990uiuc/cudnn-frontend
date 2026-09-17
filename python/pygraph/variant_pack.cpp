@@ -765,6 +765,25 @@ class VariantPackNative {
         return operands_.at(index).observed_bytes;
     }
 
+    // Every fact an engine binds from, for several operands, in ONE crossing:
+    // (pointer, dtype_code, dtype_bits, device_type, device_id, observed_bytes, shape, stride) per index.
+    py::list
+    facts(const std::vector<size_t> &indices) const {
+        py::list out;
+        for (size_t index : indices) {
+            const Operand &operand = operands_.at(index);
+            out.append(py::make_tuple(reinterpret_cast<int64_t>(pointers_.at(index)),
+                                      static_cast<int>(operand.dtype.code),
+                                      static_cast<int>(operand.dtype.bits),
+                                      operand.observed_device_type,
+                                      operand.observed_device_id,
+                                      operand.observed_bytes,
+                                      operand.shape,
+                                      stride(index)));
+        }
+        return out;
+    }
+
     std::pair<int32_t, int32_t>
     observed_device(size_t index) const {
         const Operand &operand = operands_.at(index);
@@ -1062,6 +1081,7 @@ its parts.
         .def("is_filled", &VariantPackNative::is_filled)
         .def("pointer", &VariantPackNative::pointer)
         .def("observed_bytes", &VariantPackNative::observed_bytes)
+        .def("facts", &VariantPackNative::facts)
         .def("observed_device", &VariantPackNative::observed_device)
         .def("shape", &VariantPackNative::shape)
         .def("stride", &VariantPackNative::stride)

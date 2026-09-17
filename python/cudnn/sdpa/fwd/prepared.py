@@ -73,6 +73,17 @@ def facts_of_tensor(t) -> Optional[BufferFacts]:
     return BufferFacts(t.data_ptr(), str(t.dtype).split(".")[-1], device, span, shape, strides)
 
 
+def facts_of_roles(pack, indices: List[int]) -> List[BufferFacts]:
+    """Facts of several variant-pack operands in one native crossing (see :func:`facts_of_pack`)."""
+    out = []
+    for ptr, code, bits, dev_type, dev_id, nbytes, shape, stride in pack.native.facts(list(indices)):
+        width = max(1, (int(bits) + 7) // 8)
+        out.append(
+            BufferFacts(int(ptr), _DTYPE_BY_CODE.get((code, bits), ""), (dev_type, dev_id), -1 if nbytes < 0 else nbytes // width, tuple(shape), tuple(stride))
+        )
+    return out
+
+
 def facts_of_pack(pack, index: int) -> BufferFacts:
     """Facts of variant-pack operand ``index``: the producer's observed span / device, the
     effective (graph-described, overridden) geometry; no operand object is built."""
@@ -514,7 +525,7 @@ class PreparedThdLaunch:
                 indices = self._indices = [pack.index_of(u) for u in self._uids]
             except KeyError as exc:
                 raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
-        facts = {role: facts_of_pack(pack, i) for role, i in zip(self._roles, indices)}
+        facts = dict(zip(self._roles, facts_of_roles(pack, indices)))
         frame = bind_thd(self.spec, facts, workspace_ptr, stream, stream_int)
         if frame is not None:
             self.spec.fn(*frame)
