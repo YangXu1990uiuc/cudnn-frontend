@@ -49,6 +49,26 @@ def _is_dense(dim, stride) -> bool:
     return True
 
 
+def _observed_span(data) -> Optional[int]:
+    """Element span of a caller's buffer as the CALLER describes it (``1 + sum((size-1)*stride)``,
+    numel when compact); None for a bare address or a producer without shape/stride."""
+    if data is None or type(data) is int:
+        return None
+    try:
+        shape, strides = tuple(data.shape), tuple(data.stride())
+    except (AttributeError, TypeError):
+        try:
+            return int(data.numel())
+        except (AttributeError, TypeError):
+            return None
+    n = 1
+    for extent in shape:
+        n *= int(extent)
+    if n == 0:
+        return 0
+    return 1 + sum((int(size) - 1) * int(stride) for size, stride in zip(shape, strides))
+
+
 def _in_axis_order_of(shape, stride, reference_stride):
     """``(shape, stride)`` re-expressed in the axis order ``reference_stride`` uses.
 
@@ -2030,6 +2050,11 @@ class pygraph:
         # its own description; the engine decides. The rule runs natively, one
         # crossing per pack: this is on every execute's critical path.
         from_graph.extend(native.describe_from(self._declared_layout(order), from_graph))
+        observed = {}
+        for i in from_graph:
+            span = _observed_span(uid_to_data.get(order[i]))
+            if span is not None:
+                observed[i] = span
         if override_uids:
             # The backend refuses a partial override; a short list must not
             # quietly mean "keep the rest" here.
@@ -2068,7 +2093,7 @@ class pygraph:
                 workspace_bytes = _byte_size(workspace_tensor)
             else:
                 workspace_ptr, workspace_bytes = extent
-        return VariantPack(tuple(order), native, workspace_ptr, workspace_bytes, tuple(from_graph))
+        return VariantPack(tuple(order), native, workspace_ptr, workspace_bytes, tuple(from_graph), observed)
 
     def _declared_layout(self, order: List[int]):
         """The storage-slot geometry each slot of ``order`` was declared with,

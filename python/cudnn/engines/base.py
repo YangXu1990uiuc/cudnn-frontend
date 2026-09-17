@@ -147,13 +147,17 @@ class VariantPack:
     pointers — silently, because every pointer in it is individually valid.
     """
 
-    __slots__ = ("uids", "native", "_index_of", "workspace", "workspace_bytes", "_device", "graph_described")
+    __slots__ = ("uids", "native", "_index_of", "workspace", "workspace_bytes", "_device", "graph_described", "observed_span")
 
-    def __init__(self, uids, native, workspace_ptr: int = 0, workspace_bytes: int = 0, graph_described=()):
+    def __init__(self, uids, native, workspace_ptr: int = 0, workspace_bytes: int = 0, graph_described=(), observed_span=None):
         self.uids = uids
         self.native = native
         self.workspace = workspace_ptr
         self.workspace_bytes = workspace_bytes
+        # {slot: element span of the CALLER's buffer} for the graph_described slots: their native
+        # description is the graph's, whose ragged span says nothing about the buffer; an engine
+        # deriving a capacity (THD token extents) reads the producer's own span here.
+        self.observed_span = observed_span or {}
         # Slots whose dim/stride were lent by the graph because the caller
         # passed a bare address. Usually empty. An engine that reads extents by
         # axis position needs this: the graph and the caller order a matmul's B

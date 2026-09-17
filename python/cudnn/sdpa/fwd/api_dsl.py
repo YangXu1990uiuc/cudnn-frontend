@@ -2259,6 +2259,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._compile_combine()
         self._logger.debug("compile completed")
 
+    def _prepared_launch_supported(self) -> bool:
+        """Whether the lowering may build a :class:`cudnn.sdpa.fwd.prepared.PreparedThdLaunch` for this plan:
+        the packed (THD) f16 / bf16 forward on an explicit-ABI template, unpaged, no split."""
+        return bool(self.thd and not self.paged and not self._fp8 and self.split_kv == 1 and getattr(self._k_mod, "EXPLICIT_ABI", False))
+
     @property
     def _explicit_abi(self) -> bool:
         """The kernel module declares the pointer/int host entry (``EXPLICIT_ABI``); every SM100 / SM107 template does."""

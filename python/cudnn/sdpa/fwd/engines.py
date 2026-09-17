@@ -1859,6 +1859,22 @@ def lower_dsl_prefill(
     _execute.workspace_bytes = total_workspace_bytes
     _execute.binding = binding
     _execute.execute_resolved = _execute_by_tensor
+    _execute.prepared = None
+    if (
+        facts.thd
+        and not facts.has_paged_kv
+        and not (facts.is_fp8 or facts.is_mxfp8)
+        and not synth_kv_padding
+        and bias_src is None
+        and gate_src is None
+        and getattr(api, "_prepared_launch_supported", lambda: False)()
+    ):
+        from cudnn.sdpa.fwd.prepared import PreparedThdLaunch
+
+        try:
+            _execute.prepared = PreparedThdLaunch(api, binding, scale_softmax=facts.scale)
+        except NotImplementedError as exc:  # the artifact or plan is outside the prepared path's domain: tensor-argument path
+            _LOG.debug("%s: prepared launch unavailable (%s); executing through the adapter", spec.name, exc)
     return _execute
 
 
