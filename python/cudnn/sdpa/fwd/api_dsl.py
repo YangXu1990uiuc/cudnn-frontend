@@ -517,6 +517,8 @@ class SdpaFwdDsl(APIBase):
         stats_log2: bool = False,
         sample_gate: Optional[torch.Tensor | TensorDesc] = None,
         has_amax_o: bool = True,
+        *,
+        warn_experimental: bool = True,
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
 
@@ -558,6 +560,11 @@ class SdpaFwdDsl(APIBase):
         the compile-knob fold-out on kernels that carry ``has_amax``. The graph
         path derives both from the same fact (an ``Amax_O`` output or not).
 
+        ``warn_experimental`` (keyword-only): constructing an adapter directly is
+        experimental-API use and logs the once-per-class WARNING. The graph
+        planner (``engines.lower_dsl_prefill``) passes ``False``: its caller used
+        the stable graph API, not this class.
+
         Paged KV (``paged_page_size > 0``): ``sample_k`` / ``sample_v`` are the
         page POOLS ``[num_pages, H_kv, page_size, D]`` — HND compact, or NHD
         storage declared through the strides; the layout is nothing but those
@@ -571,7 +578,8 @@ class SdpaFwdDsl(APIBase):
         """
 
         super().__init__()
-        self._warn_experimental_api()
+        if warn_experimental:
+            self._warn_experimental_api()
         self._logger.debug("Entering __init__")
 
         self.q_desc = self._make_tensor_desc(sample_q, name="q")

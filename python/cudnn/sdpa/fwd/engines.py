@@ -1710,6 +1710,7 @@ def lower_dsl_prefill(
         pack_gqa=knobs.pack_gqa if knobs is not None else None,
         split_kv=knobs.split_kv if knobs is not None else None,
         softmax_precision=facts.softmax_precision,  # op attribute (None = the f32 pipeline)
+        warn_experimental=False,  # the caller used the graph API, not this class
         # Epilogue gate (sample_gate=) and the Amax_O fold-out (has_amax_o=):
         # feature-detected on the adapter's constructor, see the helper.
         **_epilogue_gate_ctor_kwargs(facts, _ctor_params, _exec_params, spec.name),

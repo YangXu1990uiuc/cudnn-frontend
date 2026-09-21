@@ -14,14 +14,14 @@ measurements using ``benchmark/attention_inference`` (``cudnn_oss`` vs ``cudnn``
 cuDNN 9.27, cutlass DSL 4.7.1, torch profiler, L2 flushed, median of 20. A separate B200 follow-up
 used public cuDNN 9.26 GA for the D512 single-token boundary. These measurements exclude host
 enqueue overhead. Re-evaluate rankings offline when kernels or backend versions change.
-``test_sdpa_fwd_placement.py`` pins the verdict on one representative graph per shard (CPU-only),
-so a threshold cannot move without a test naming the shard; the marker hook is pinned with
-synthetic verdicts. Raw measurements are archived separately. The canonical copy is the fork tag
-``pr1152-data-2026-09-18`` on ``YangXu1990uiuc/cudnn-frontend`` (commit 0501eca2f carries the
-2026-09-18 CSVs in-tree under ``benchmark/attention_inference/results``: model configs from B200
-``umbriel-b200-247`` and RTX PRO 6000 ``smc521ge-0038``, the prefill/decode sweeps from B200
-``umbriel-b200-042``/``-091``); the D512 single-token follow-up (2026-09-19, public cuDNN 9.26) is
-the fork tag ``pr1152-d512-followup-2026-09-19`` (commit db71b8886,
+``test_sdpa_fwd_placement.py`` pins the marker hook and the opt-in override with synthetic verdicts;
+the thresholds themselves are performance policy, re-evaluated offline against the archived
+measurements rather than pinned by tests. Raw measurements are archived separately. The canonical
+copy is the fork tag ``pr1152-data-2026-09-18`` on ``YangXu1990uiuc/cudnn-frontend`` (commit
+0501eca2f carries the 2026-09-18 CSVs in-tree under ``benchmark/attention_inference/results``: model
+configs from B200 ``umbriel-b200-247`` and RTX PRO 6000 ``smc521ge-0038``, the prefill/decode sweeps
+from B200 ``umbriel-b200-042``/``-091``); the D512 single-token follow-up (2026-09-19, public cuDNN
+9.26) is the fork tag ``pr1152-d512-followup-2026-09-19`` (commit db71b8886,
 ``results/d512_boundary/b200``). The NVIDIA-internal runner output behind the 09-18 CSVs sits in
 ``/home/scratch.yanxu_gpu/fe-sites/computelab_bench/``.
 

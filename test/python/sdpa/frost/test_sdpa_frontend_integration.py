@@ -8,6 +8,8 @@ and any entry of that list is selectable with select_plan()."""
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 import torch
 
@@ -143,6 +145,32 @@ def test_select_dsl_engine_runs_and_matches_torch():
         scale=1.0 / (D**0.5),
     )
     torch.testing.assert_close(o_gpu, ref, atol=5e-2, rtol=3e-2)
+
+
+@_SM100_DSL
+def test_planner_built_adapter_does_not_warn_experimental(caplog):
+    """The experimental-API WARNING is for callers who construct an adapter
+    themselves; a graph-API user whose plan the planner lowers through one
+    never called that class (#1152 made FROST the default on SM100 f16)."""
+    from cudnn.api_base import _reset_experimental_api_warning_registry
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    def experimental():
+        return [r.getMessage() for r in caplog.records if "experimental API" in r.getMessage()]
+
+    _reset_experimental_api_warning_registry()
+    with caplog.at_level(logging.WARNING):
+        g, q, k, v, o = _build_causal_sdpa()
+        _plan(g)
+        _pin(g, _FROST)
+        g.check_support()
+        g.build_plans()
+        assert experimental() == []
+        qkv = torch.empty(B, S, H, D, device="cuda", dtype=torch.float16).transpose(1, 2)
+        o_gpu = torch.empty(B, S, H, D, device="cuda", dtype=torch.float16).transpose(1, 2)
+        for _ in range(2):
+            SdpaFwdDslSm100(sample_q=qkv, sample_k=qkv, sample_v=qkv, sample_o=o_gpu, is_causal=True)
+        assert experimental() == ["SdpaFwdDslSm100 is an experimental API"]
 
 
 @_SM100_DSL
