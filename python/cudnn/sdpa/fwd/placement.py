@@ -13,9 +13,19 @@ Thresholds are tunable performance policy, initially fitted to B200 / RTX PRO 60
 measurements using ``benchmark/attention_inference`` (``cudnn_oss`` vs ``cudnn``), 2026-09-18,
 cuDNN 9.27, cutlass DSL 4.7.1, torch profiler, L2 flushed, median of 20. A separate B200 follow-up
 used public cuDNN 9.26 GA for the D512 single-token boundary. These measurements exclude host
-enqueue overhead. Re-evaluate rankings offline when kernels or backend versions change;
-unit tests exercise placement-marker contracts with synthetic verdicts rather than pinning
-workload winners to historical timing data. Raw measurements are archived separately.
+enqueue overhead. Re-evaluate rankings offline when kernels or backend versions change.
+``test_sdpa_fwd_placement.py`` pins the verdict on one representative graph per shard (CPU-only),
+so a threshold cannot move without a test naming the shard; the marker hook is pinned with
+synthetic verdicts. Raw measurements are archived separately: NVIDIA-internal
+``/home/scratch.yanxu_gpu/fe-sites/computelab_bench/`` (runner CSVs, 2026-09-18; B200
+``umbriel-b200-247``, RTX PRO 6000 ``smc521ge-0038``; cuDNN 9.27, DSL 4.7.1) and the fork tag
+``pr1152-data-2026-09-18`` on ``YangXu1990uiuc/cudnn-frontend``, whose commit 0501eca2f carries
+the CSVs in-tree under ``benchmark/attention_inference/results``.
+
+Extrapolated, not measured: SM103 (GB300) is served by the same SM100 row with the B200-fitted
+verdicts. SM120 THD and paged prefill inherit LEAD from the dense measurements. The d192x128
+decode-shaped LEAD (``2 <= s_q <= 16``) follows the measured flavors; that flavor has no decode
+tile and was not timed.
 
 SM100 f16/bf16 row (B200, 148 SMs, 1965 MHz):
 
