@@ -204,10 +204,21 @@ def test_prepared_fp8_paged_rejects_invalid_overrides_before_launch(role, defect
         shape, strides = list(bufs[role].shape), list(bufs[role].stride())
         if defect == "short_pool":
             shape[0] += 1
-            message = "page pool spans"
+            other = "v" if role == "k" else "k"
+            # Keep equal effective pool counts, with actual extra storage only
+            # for the other pool. A count mismatch would mask the missing bound.
+            n, h, p, d = shape
+            bufs[other] = torch.empty((n, p, h, d), device="cuda", dtype=bufs[other].dtype).transpose(1, 2)
+            vp[tensors[other]] = bufs[other]
+            overrides = dict(
+                override_uids=[tensors[role].get_uid(), tensors[other].get_uid()],
+                override_shapes=[shape, list(bufs[other].shape)],
+                override_strides=[strides, list(bufs[other].stride())],
+            )
+            message = role + ": page pool spans"
         else:
             strides[0] += 1
+            overrides = dict(override_uids=[tensors[role].get_uid()], override_shapes=[shape], override_strides=[strides])
             message = "16-byte aligned"
-        overrides = dict(override_uids=[tensors[role].get_uid()], override_shapes=[shape], override_strides=[strides])
     with pytest.raises(ValueError, match=message):
         g.execute(vp, ws, **overrides)
