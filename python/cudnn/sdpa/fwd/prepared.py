@@ -160,8 +160,9 @@ def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_s
         combine_args = (*combine_args[:-1], amax if quant.has_amax else None, patches["scale_o_ptr"], stream)
         if spec.combine.output_dtype in ("float8_e4m3fn", "float8_e5m2"):
             # FP8 rounding and scale_o belong to the final combine, once.
-            patches["scale_o_ptr"] = identity
-            needs_identity = True
+            # The main host None-specializes its scale to one. Avoid an
+            # identity memset (and its captured engine dependency) per call.
+            patches["scale_o_ptr"] = None
     else:
         frame = bind_dense(spec, facts, stream, stream_int)
     if needs_identity:

@@ -47,7 +47,7 @@ def host(
     descale_q_ptr: cute.Pointer,
     descale_k_ptr: cute.Pointer,
     descale_v_ptr: cute.Pointer,
-    scale_o_ptr: cute.Pointer,
+    scale_o_ptr: Optional[cute.Pointer],
     amax_o_ptr: cute.Pointer,
     has_amax: cutlass.Constexpr[bool],
     kernel_host: cutlass.Constexpr,
@@ -134,7 +134,7 @@ def host(
         scalar(descale_q_ptr),
         scalar(descale_k_ptr),
         scalar(descale_v_ptr),
-        scalar(scale_o_ptr),
+        None if cutlass.const_expr(scale_o_ptr is None) else scalar(scale_o_ptr),
         scalar(amax_o_ptr),
         seq_q_lens_addr,
         thd_q_lens_tensor,
@@ -148,7 +148,7 @@ def host(
         _unscale_amax_kernel(amax_o_ptr, scale_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
 
 
-def compile_host(kernel_host, cfg, storage_dtype, output_dtype, d256, cache_key, d_qk, d_v, has_lse, lse_kind, has_amax):
+def compile_host(kernel_host, cfg, storage_dtype, output_dtype, d256, cache_key, d_qk, d_v, has_lse, lse_kind, has_amax, scale_o_in_combine=False):
     if cfg.SPLIT_KV > 1 and not has_lse:
         raise ValueError("prepared FP8 split-KV requires partial LSE")
     gmem = cute.AddressSpace.gmem
@@ -190,7 +190,7 @@ def compile_host(kernel_host, cfg, storage_dtype, output_dtype, d256, cache_key,
         P(cutlass.Float32, 4),
         P(cutlass.Float32, 4),
         P(cutlass.Float32, 4),
-        P(cutlass.Float32, 4),
+        None if scale_o_in_combine else P(cutlass.Float32, 4),
         P(cutlass.Float32, 4),
         has_amax,
         kernel_host,

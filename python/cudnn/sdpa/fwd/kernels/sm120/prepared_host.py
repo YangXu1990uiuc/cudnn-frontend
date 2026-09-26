@@ -183,7 +183,7 @@ def fp8_host(
     descale_q_ptr: cute.Pointer,
     descale_k_ptr: cute.Pointer,
     descale_v_ptr: cute.Pointer,
-    scale_o_ptr: cute.Pointer,
+    scale_o_ptr: Optional[cute.Pointer],
     amax_o_ptr: cute.Pointer,
     has_amax: cutlass.Constexpr[bool],
     kernel: cutlass.Constexpr,
@@ -246,7 +246,7 @@ def fp8_host(
         scalar(descale_q_ptr),
         scalar(descale_k_ptr),
         scalar(descale_v_ptr),
-        scalar(scale_o_ptr),
+        None if cutlass.const_expr(scale_o_ptr is None) else scalar(scale_o_ptr),
         cutlass.Int32(thd_max_sq),
         thd_q_lens,
         thd_kv_lens,
@@ -259,7 +259,9 @@ def fp8_host(
         _unscale_amax_kernel(amax_o_ptr, scale_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
 
 
-def compile_host(kernel, dtype, qh, kh, d_qk, d_v, has_lse, persistent_ctas, cache_key, thd_max_sq=0, *, output_dtype=None, has_amax=False):
+def compile_host(
+    kernel, dtype, qh, kh, d_qk, d_v, has_lse, persistent_ctas, cache_key, thd_max_sq=0, *, output_dtype=None, has_amax=False, scale_o_in_combine=False
+):
     """Compile one pointer entry with Int64 stride leaves and a fixed head geometry."""
     if kernel.thd_varlen and kernel.split_kv != 1:
         raise NotImplementedError("SM120 THD does not support split-KV")
@@ -294,7 +296,7 @@ def compile_host(kernel, dtype, qh, kh, d_qk, d_v, has_lse, persistent_ctas, cac
         ptr(cutlass.Int32, 4) if kernel.thd_varlen else None,
         cutlass.Int32(0) if kernel.thd_varlen else None,
         cutlass.Int32(0),
-        *((ptr(cutlass.Float32, 4),) * 5 + (has_amax,) if fp8 else ()),
+        *((ptr(cutlass.Float32, 4),) * 3 + (None if scale_o_in_combine else ptr(cutlass.Float32, 4), ptr(cutlass.Float32, 4), has_amax) if fp8 else ()),
         kernel,
         qh,
         kh,

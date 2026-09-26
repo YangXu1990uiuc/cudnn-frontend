@@ -35,6 +35,7 @@ import cuda.bindings.driver as cuda_driver
 import cutlass
 import cutlass.experimental.cuda as cuda
 import cutlass.cute as cute
+from cudnn.sdpa.fwd.kernels._quantized import _initialize_split_amax, _scale_or_one
 
 from cutlass.experimental import primitives as prims
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_E5M2, DTYPE_FP16
@@ -1649,7 +1650,7 @@ class SM120FusedMultiHeadAttentionForward:
         descale_q_t: cute.Tensor,
         descale_k_t: cute.Tensor,
         descale_v_t: cute.Tensor,
-        scale_o_t: cute.Tensor,
+        scale_o_t: Optional[cute.Tensor],
     ) -> None:
         """SM120 FMHA prefill kernel.
 
@@ -1683,10 +1684,12 @@ class SM120FusedMultiHeadAttentionForward:
         :param descale_v_t: ``(1,)`` fp32 device descale of V.
         :param scale_o_t: ``(1,)`` fp32 device Scale_O, applied before the O cast.
         """
+        if cutlass.const_expr(self.split_kv > 1):
+            _initialize_split_amax(amax_o)
         descale_q = cutlass.Float32(cutlass.make_array_view(descale_q_t)[0])
         descale_k = cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
         descale_v = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0])
-        scale_o = cutlass.Float32(cutlass.make_array_view(scale_o_t)[0])
+        scale_o = _scale_or_one(scale_o_t)
         softmax_scale_log2 = softmax_scale_log2 * descale_q * descale_k
         o_scale_fused = o_scale_fused * descale_v * scale_o * cutlass.Float32(2.0**-P_CAST_LOG2_SCALE)
         tidx, _, _ = cute.arch.thread_idx()
@@ -1865,7 +1868,7 @@ class SM120FusedMultiHeadAttentionForward:
         descale_q_t: cute.Tensor,
         descale_k_t: cute.Tensor,
         descale_v_t: cute.Tensor,
-        scale_o_t: cute.Tensor,
+        scale_o_t: Optional[cute.Tensor],
         thd_max_sq: cutlass.Int32,
         thd_q_lens: Optional[cute.Tensor],
         thd_kv_lens: Optional[cute.Tensor],
@@ -2156,6 +2159,7 @@ def compile(  # noqa: A001
     prepared: bool = False,
     persistent_ctas: int = 0,
     has_amax: bool = True,
+    scale_o_in_combine: bool = False,
 ) -> Callable:
     """Compile the prepared dense/THD entry or a remaining dense tensor entry.
 
@@ -2205,6 +2209,7 @@ def compile(  # noqa: A001
             thd_max_sq=sq if PARAMS.thd_varlen else 0,
             output_dtype=OUT_DTYPE,
             has_amax=has_amax,
+            scale_o_in_combine=scale_o_in_combine,
         )
     if PARAMS.thd_varlen:
         raise ValueError("SM120 FP8 THD uses prepared=True; the tensor entry is dense-only")

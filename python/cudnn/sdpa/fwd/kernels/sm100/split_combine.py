@@ -19,7 +19,7 @@ from typing import Callable, Optional, Tuple
 
 from functools import lru_cache
 
-from cudnn.sdpa.fwd.kernels._quantized import _reset_amax_kernel, _unscale_amax_kernel
+from cudnn.sdpa.fwd.kernels._quantized import _unscale_amax_kernel
 
 import cutlass
 import cutlass.cute as cute
@@ -322,14 +322,14 @@ def _host_ptr_quantized(
 
     Quantized outputs keep unscaled partials and apply scale_o here. Half outputs
     retain their existing scaled partials; normalize their requested Amax after
-    reduction. The scalar reset stays on the SM execution path during capture.
+    reduction. The preceding split-attention kernel initializes Amax, ordered
+    before this reduction on the same stream.
     """
     o_partial, lse_partial, o_out, lse_out = _ptr_operands(
         o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides
     )
     amax_o = None
     if cutlass.const_expr(amax_o_ptr is not None):
-        _reset_amax_kernel(amax_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
         amax_o = cute.make_tensor(amax_o_ptr, cute.make_layout((1,), stride=(1,)))
     scale_o = None
     if cutlass.const_expr(has_scale_o):

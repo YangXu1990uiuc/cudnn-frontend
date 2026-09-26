@@ -2604,6 +2604,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         kw = dict(has_lse=(self.lse_desc is not None) or self.split_kv > 1, lse_kind=kind)
         if "has_amax" in accepted:
             kw["has_amax"] = self.has_amax_o
+        if "scale_o_in_combine" in accepted:
+            kw["scale_o_in_combine"] = self._split_scale_o()
         if "d_qk" in accepted:  # head-dim envelope
             kw.update(d_qk=self.head_dim_qk, d_v=self.head_dim_v)
         if "paged_hnd" in accepted and self.paged:
@@ -4709,7 +4711,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 lse_padded_rows=self.s_q_max if self.thd_stats_padded else 0,
                 lse_stride=self._lse_stride if self.thd_stats_padded else None,
                 prepared=True,
-                **({"has_amax": self.has_amax_o} if self._prepared_fp8 else {}),
+                **({"has_amax": self.has_amax_o, "scale_o_in_combine": self._split_scale_o()} if self._prepared_fp8 else {}),
                 persistent_ctas=self._persistent_ctas(self.q_desc.device) if self.flavor == _SM120_D512_FLAVOR else 0,
             )
             if self.thd:
