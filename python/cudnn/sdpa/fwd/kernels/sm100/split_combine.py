@@ -19,6 +19,8 @@ from typing import Callable, Optional, Tuple
 
 from functools import lru_cache
 
+from cudnn.sdpa.fwd.kernels._quantized import _reset_amax_kernel, _unscale_amax_kernel
+
 import cutlass
 import cutlass.cute as cute
 from cutlass._mlir.dialects import arith
@@ -301,6 +303,43 @@ def _host_ptr(
 
 
 @cute.jit
+def _host_ptr_quantized(
+    o_partial_ptr: cute.Pointer,
+    lse_partial_ptr: cute.Pointer,
+    o_out_ptr: cute.Pointer,
+    lse_out_ptr: Optional[cute.Pointer],
+    problem_size: Tuple[int, int, int, int],
+    n_splits: cutlass.Int32,
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    amax_o_ptr: Optional[cute.Pointer],
+    scale_o_ptr: cute.Pointer,
+    has_scale_o: cutlass.Constexpr[bool],
+    stats_log2: cutlass.Constexpr[bool],
+    stream: _cuda_driver.CUstream = None,
+) -> None:
+    """Reduce FP8-input partials, then scale/cast and report the recombined Amax.
+
+    Quantized outputs keep unscaled partials and apply scale_o here. Half outputs
+    retain their existing scaled partials; normalize their requested Amax after
+    reduction. The scalar reset stays on the SM execution path during capture.
+    """
+    o_partial, lse_partial, o_out, lse_out = _ptr_operands(
+        o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides
+    )
+    amax_o = None
+    if cutlass.const_expr(amax_o_ptr is not None):
+        _reset_amax_kernel(amax_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
+        amax_o = cute.make_tensor(amax_o_ptr, cute.make_layout((1,), stride=(1,)))
+    scale_o = None
+    if cutlass.const_expr(has_scale_o):
+        scale_o = cute.make_tensor(scale_o_ptr, cute.make_layout((1,), stride=(1,)))
+    _launch_combine(o_partial, lse_partial, o_out, lse_out, amax_o, scale_o, problem_size, n_splits, stats_log2, None, None, None, (1, 1, 1), (0, 0), stream)
+    if cutlass.const_expr(amax_o_ptr is not None and not has_scale_o):
+        _unscale_amax_kernel(amax_o_ptr, scale_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
+
+
+@cute.jit
 def _host_ptr_ragged(
     o_partial_ptr: cute.Pointer,
     lse_partial_ptr: cute.Pointer,
@@ -362,8 +401,11 @@ def compile_ptr(
     stats_log2: bool = False,
     ragged: bool = False,
     ragged_i64: bool = False,
+    quantized: bool = False,
+    has_amax: bool = False,
+    has_scale_o: bool = False,
 ) -> Callable:
-    """Compile a shape-generic pointer entry for prepared f16/bf16 execution.
+    """Compile a shape-generic pointer entry for prepared split execution.
 
     The runtime arguments are partial-O/partial-LSE/O/optional-LSE pointers,
     ``(B, H, S_q, D_v)``, split count, O strides in BSHD order, LSE strides
@@ -371,11 +413,15 @@ def compile_ptr(
     Stats offsets, int32 or -- ``ragged_i64`` -- int64; None-specialized off
     otherwise) and their elements-per-token divisors. Every stride is Int64,
     including singleton dimensions. This entry shares the reduction and launch
-    with :func:`compile`; the tensor ABI remains available for quantized
-    outputs with their amax/scale operands.
+    with :func:`compile`. The quantized dense entry appends Amax/scale
+    pointers; half and ragged entries keep their existing positional ABI.
     """
-    if dtype_o not in ("f16", "bf16") or dtype_partial not in ("f16", "bf16", "f32"):
-        raise ValueError("prepared split combine requires f16/bf16 O and f16/bf16/f32 partials")
+    if dtype_o not in ("f16", "bf16", "e4m3", "e5m2") or dtype_partial not in ("f16", "bf16", "f32"):
+        raise ValueError("prepared split combine requires half/FP8 O and f16/bf16/f32 partials")
+    if (has_amax or has_scale_o or dtype_o in ("e4m3", "e5m2")) and not quantized:
+        raise ValueError("FP8 outputs and scalar operands require the quantized pointer entry")
+    if quantized and ragged:
+        raise ValueError("the quantized pointer entry serves dense split launches")
     if ragged_i64 and not ragged:
         raise ValueError("ragged_i64 is a ragged specialization")
     _cache_key = _template_key(globals(), locals(), "compile_ptr")
@@ -394,7 +440,9 @@ def compile_ptr(
         (cutlass.Int64(0),) * 4,
         (cutlass.Int64(0),) * 3,
     )
-    if ragged:
+    if quantized:
+        entry, extra = _host_ptr_quantized, (P(cutlass.Float32) if has_amax else None, P(cutlass.Float32), bool(has_scale_o))
+    elif ragged:
         # The ragged-Q leg's entry appends the offsets / divisors / capacities; the
         # dense entry's positional ABI stays exactly what its callers pass.
         off_t = cutlass.Int64 if ragged_i64 else cutlass.Int32

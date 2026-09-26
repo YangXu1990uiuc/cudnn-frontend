@@ -104,7 +104,7 @@ def host(
         d_v=d_v,
         lse_kind=lse_kind,
         thd=cfg.THD_VARLEN,
-        split_kv=1,
+        split_kv=cfg.SPLIT_KV,
         tensor_map_qwords=16,
         paged=False,
         page_size=0,
@@ -124,7 +124,8 @@ def host(
         args += (False,)
     # Keep the scalar reset on the SM execution path. A captured driver
     # memset creates an extra engine dependency before the attention kernel.
-    _reset_amax_kernel(amax_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
+    if cutlass.const_expr(cfg.SPLIT_KV == 1):
+        _reset_amax_kernel(amax_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     kernel_host(
         *args,
         scale_softmax_log2,
@@ -139,14 +140,17 @@ def host(
         thd_q_lens_tensor,
         thd_kv_lens_tensor,
         thd_lens_form,
+        o_partial_f32=o_partial_f32,
         stream=stream,
         prepared=True,
     )
-    if cutlass.const_expr(has_amax):
+    if cutlass.const_expr(has_amax and cfg.SPLIT_KV == 1):
         _unscale_amax_kernel(amax_o_ptr, scale_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
 
 
 def compile_host(kernel_host, cfg, storage_dtype, output_dtype, d256, cache_key, d_qk, d_v, has_lse, lse_kind, has_amax):
+    if cfg.SPLIT_KV > 1 and not has_lse:
+        raise ValueError("prepared FP8 split-KV requires partial LSE")
     gmem = cute.AddressSpace.gmem
 
     def P(dtype, align=16):
@@ -160,7 +164,7 @@ def compile_host(kernel_host, cfg, storage_dtype, output_dtype, d256, cache_key,
         P(storage_dtype),
         P(storage_dtype),
         P(storage_dtype),
-        P(output_dtype),
+        P(cutlass.Float32 if cfg.SPLIT_KV > 1 else output_dtype),
         P(cutlass.Float32, 4) if has_lse else None,
         P(cutlass.Float32),
         P(cutlass.Int32),
@@ -178,7 +182,7 @@ def compile_host(kernel_host, cfg, storage_dtype, output_dtype, d256, cache_key,
         P(cutlass.Int32, 4) if thd else None,
         P(cutlass.Int32, 4) if thd else None,
         i32 if thd else None,
-        None,
+        P(cutlass.Float32) if cfg.SPLIT_KV > 1 else None,
         None,
         None,
         (cutlass.Int64(0), cutlass.Int64(0)),
@@ -204,7 +208,7 @@ def compile_host(kernel_host, cfg, storage_dtype, output_dtype, d256, cache_key,
 
 
 def make_fake_aux(b, qh, *, amax_align=16):
-    """Dense tensor-entry auxiliaries for the remaining split/paged/conversion paths.
+    """Dense tensor-entry auxiliaries for remaining paged/conversion/block-scale paths.
 
     Prepared launches never construct these tensor fakes. All SM100 per-tensor
     FP8 THD routes now use the pointer entry, so no packed metadata, descriptor

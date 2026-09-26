@@ -2958,8 +2958,8 @@ def compile_prepared(
     cache_key = _template_key(globals(), locals(), "compile_prepared")
     from cudnn.sdpa.fwd.kernels.sm100.fp8_host import LSE_KINDS, compile_host
 
-    if PARAMS.paged_kv or SPLIT_KV != 1 or getattr(CFG, "O_BLOCK_SCALE", 0):
-        raise NotImplementedError("prepared FP8 serves unsplit, non-paged scalar-scaled outputs")
+    if PARAMS.paged_kv or getattr(CFG, "O_BLOCK_SCALE", 0):
+        raise NotImplementedError("prepared FP8 serves non-paged scalar-scaled outputs")
     if (d_qk, d_v) != (CFG.TILE_K, CFG.TILE_O):
         raise NotImplementedError("prepared FP8 requires the native head dimensions")
     if lse_kind not in LSE_KINDS:

@@ -2161,7 +2161,7 @@ def compile(  # noqa: A001
 
     Packed capacities and Int64 strides bind at execution. Head geometry and
     Stats packing specialize the pointer host; THD no longer creates tensor fakes.
-    Dense split, block-scaled output and conversion layouts retain the tensor entry.
+    Block-scaled output and conversion layouts retain the tensor entry.
     """
 
     _cache_key = _template_key(globals(), locals(), "compile")

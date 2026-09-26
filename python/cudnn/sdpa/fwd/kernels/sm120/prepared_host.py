@@ -229,7 +229,8 @@ def fp8_host(
 
     # The attention epilogue uses atomicMax on the nonnegative fp32 bit pattern.
     amax_i32 = cute.make_ptr(cutlass.Int32, amax_o_ptr.toint(), cute.AddressSpace.gmem, assumed_align=4)
-    _reset_amax_kernel(amax_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
+    if cutlass.const_expr(kernel.split_kv == 1):
+        _reset_amax_kernel(amax_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     kernel(
         q,
         k,
@@ -254,7 +255,7 @@ def fp8_host(
         stream,
         prepared=True,
     )
-    if cutlass.const_expr(has_amax):
+    if cutlass.const_expr(has_amax and kernel.split_kv == 1):
         _unscale_amax_kernel(amax_o_ptr, scale_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
 
 

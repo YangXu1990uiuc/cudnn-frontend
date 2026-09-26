@@ -1443,6 +1443,10 @@ class SdpaFwdDsl(APIBase):
             return "e5m2" if o_dtype == torch.float8_e5m2 else "e4m3"
         return "bf16" if o_dtype == torch.bfloat16 else "f16"
 
+    def _split_workspace_bytes(self):
+        rows = self.split_kv * self.batch_size * self.s_q_max * self.h_q
+        return ws_align(rows * self.head_dim_v * self._o_itemsize()) + ws_align(rows * 4)
+
     def _split_partials(self, workspace, device, current_stream=None):
         """The split-major (O, LSE) partial buffers, carved from the caller's
         workspace when there is one and torch-allocated otherwise (standalone
@@ -2526,7 +2530,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # kernel may still allocate (a tensor into a None-specialised slot is
         # an argument mismatch at execute).
         self._combine_amax = False
-        if self.split_kv > 1 and self._fp8:
+        if self.split_kv > 1 and self._fp8 and not self._prepared_fp8:
             # The recombine pass compiles at PLAN time like everything else;
             # execute() only rebinds the partial slabs it carves. On the FP8
             # families the combine also owns the amax of the recombined O
@@ -2560,7 +2564,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and (self.head_dim_qk, self.head_dim_v) in ((128, 128), (192, 128), (256, 256), (512, 512))
             and self._o_dtype() in (torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2)
             and not self.paged
-            and self.split_kv == 1
             and not self.o_block_scale
             and self.gate_desc is None
         ):
@@ -2569,10 +2572,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
         return self.thd or all(
             dense_bind_strides(tuple(desc.shape), tuple(desc.stride), desc.dtype.itemsize) is not None
-            for desc in (self.q_desc, self.k_desc, self.v_desc, self.o_desc)
+            for desc in (self.q_desc, self.k_desc, self.v_desc) + (() if self.split_kv > 1 else (self.o_desc,))
         )
 
     def _prepared_quant_offset(self):
+        if self.split_kv > 1:
+            return self._split_workspace_bytes()
         if self.thd:
             b = self.batch_size
             return ws_align((4 * b + 4) * 4) + ws_align((b + 3) * 16 * 8) + (0 if self.has_sink else ws_align(self.h_q * 4))
@@ -2809,9 +2814,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # (wider than O -- fp32 on SM100, half on SM120; the combine owns
             # the cast down) and lse_s [splits*B, H, S_q] fp32. Carved from the caller's
             # workspace — zero per-execute allocations (Hard Rule 1).
-            o_bytes = self.split_kv * b * self.s_q_max * qh * self.head_dim_v * self._o_itemsize()
-            lse_bytes = self.split_kv * b * qh * self.s_q_max * 4
-            return ws_align(o_bytes) + ws_align(lse_bytes)
+            return self._split_workspace_bytes()
         # Dense padded-Q lens bind directly as their own kernel parameter
         # (no combine buffer since the seq_len_q-as-parameter change) — no scratch.
         return 0
@@ -5228,9 +5231,11 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         return self.thd or all(dense_bind_strides(tuple(desc.shape), tuple(desc.stride), desc.dtype.itemsize) is not None for desc in operands)
 
     def _can_prepare_fp8(self):
-        return self._fp8 and self.split_kv == 1 and not self.o_block_scale and self._can_prepare_layout()
+        return self._fp8 and not self.o_block_scale and self._can_prepare_layout()
 
     def _prepared_quant_offset(self):
+        if self.split_kv > 1:
+            return self._split_workspace_bytes()
         # SM120 has metadata but no per-sequence TMA O descriptor array.
         return ws_align((4 * self.batch_size + 4) * 4) if self.thd else 0
 
@@ -5253,10 +5258,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         if self.split_kv > 1:
             # Split-major partial slabs (see the SM100 sibling): O_s in the O
             # dtype (half) + lse_s fp32, carved from the caller's workspace.
-            b, qh = self.batch_size, self.h_q
-            o_bytes = self.split_kv * b * self.s_q_max * qh * self.head_dim_v * self._o_itemsize()
-            lse_bytes = self.split_kv * b * qh * self.s_q_max * 4
-            return ws_align(o_bytes) + ws_align(lse_bytes)
+            return self._split_workspace_bytes()
         return 0
 
 
