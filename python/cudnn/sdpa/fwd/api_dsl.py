@@ -4686,12 +4686,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         )
         self._k_mod = _load_sm120_kernel_module(self.flavor, params, fp8=self._fp8)
         self._dense_spec = self._thd_spec = None
-        from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
-
-        self._prepared_fp8 = self._fp8 and self.split_kv == 1 and not self.o_block_scale
-        operands = (self.q_desc, self.k_desc, self.v_desc) + (() if self.split_kv > 1 else (self.o_desc,))
-        direct_layout = self.thd or all(dense_bind_strides(tuple(desc.shape), tuple(desc.stride), desc.dtype.itemsize) is not None for desc in operands)
-        self._prepared_fp8 = self._prepared_fp8 and direct_layout
+        direct_layout = self._can_prepare_layout()
+        self._prepared_fp8 = self._can_prepare_fp8()
         if (not self._fp8 or self._prepared_fp8) and direct_layout:
             from cudnn.sdpa.fwd.prepared import build_dense_spec, build_thd_spec
 
@@ -5225,12 +5221,22 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             _THD_CTAS_CACHE[key] = n
         return n
 
+    def _can_prepare_layout(self):
+        from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
+
+        operands = (self.q_desc, self.k_desc, self.v_desc) + (() if self.split_kv > 1 else (self.o_desc,))
+        return self.thd or all(dense_bind_strides(tuple(desc.shape), tuple(desc.stride), desc.dtype.itemsize) is not None for desc in operands)
+
+    def _can_prepare_fp8(self):
+        return self._fp8 and self.split_kv == 1 and not self.o_block_scale and self._can_prepare_layout()
+
     def _prepared_quant_offset(self):
         # SM120 has metadata but no per-sequence TMA O descriptor array.
         return ws_align((4 * self.batch_size + 4) * 4) if self.thd else 0
 
     def scratch_workspace_bytes(self) -> int:
-        if getattr(self, "_prepared_fp8", False):
+        self._ensure_support_checked()
+        if self._can_prepare_fp8():
             return self._prepared_quant_offset() + ws_align(8)
         if self.thd:
             # [meta(seq_kv, cu_q, cu_k)].

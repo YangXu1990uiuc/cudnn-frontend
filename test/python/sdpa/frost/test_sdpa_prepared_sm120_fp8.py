@@ -13,6 +13,65 @@ from frost_test_utils import requires_blackwell_geforce, requires_dsl
 pytestmark = [pytest.mark.L0, requires_dsl, requires_blackwell_geforce]
 
 
+@pytest.mark.parametrize("thd", [False, True])
+@pytest.mark.parametrize("d", [128, 512])
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_sm120_fp8_workspace_sized_before_compile(thd, d, output_dtype):
+    """Standalone callers may allocate the final scratch size after check_support."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    torch.manual_seed(827)
+    b, sq, skv, hq, hk = 2, 16, 128, 4, 2
+    q = (torch.randn(b, sq, hq, d, device="cuda") * 0.4).to(torch.float8_e4m3fn).transpose(1, 2)
+    k = (torch.randn(b, skv, hk, d, device="cuda") * 0.4).to(torch.float8_e4m3fn).transpose(1, 2)
+    v = torch.randn_like(k.float()).mul_(0.4).to(torch.float8_e4m3fn)
+    o = torch.empty((b, sq, hq, d), device="cuda", dtype=output_dtype).transpose(1, 2)
+    api = SdpaFwdDslSm120(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=o,
+        pertensor_fp8=True,
+        thd=thd,
+        seq_q_lens_present=False,
+        seq_kv_lens_present=thd,
+        pack_gqa=False,
+        split_kv=1,
+        max_total_seq_len_q=b * sq if thd else None,
+        max_total_seq_len_kv=b * skv if thd else None,
+    )
+    assert api.check_support()
+    before = api.scratch_workspace_bytes()
+    workspace = torch.empty(before, device="cuda", dtype=torch.uint8)
+    api.compile()
+    assert before == api.scratch_workspace_bytes(), "compilation must not increase caller workspace requirements"
+    bufs = {"q": q, "k": k, "v": v, "o": o}
+    if thd:
+        for name, heads in (("q", hq), ("k", hk), ("v", hk), ("o", hq)):
+            bufs[name] = bufs[name].transpose(1, 2).reshape(-1, heads, d)
+    for name in ("descale_q", "descale_k", "descale_v", "scale_o"):
+        bufs[name] = torch.ones(1, device="cuda")
+    bufs["amax_o"] = torch.full((1,), 999.0, device="cuda")
+    lens = (
+        dict(
+            seq_q_lens=torch.full((b,), sq, device="cuda", dtype=torch.int32),
+            seq_kv_lens=torch.full((b,), skv, device="cuda", dtype=torch.int32),
+        )
+        if thd
+        else {}
+    )
+    api.execute(
+        q_tensor=bufs["q"],
+        k_tensor=bufs["k"],
+        v_tensor=bufs["v"],
+        o_tensor=bufs["o"],
+        workspace=workspace,
+        **{name: bufs[name] for name in ("descale_q", "descale_k", "descale_v", "scale_o", "amax_o")},
+        **lens,
+    )
+    shared._check(bufs, thd=thd, sq=sq, skv=skv)
+
+
 @pytest.fixture(autouse=True)
 def sm120_cases(monkeypatch):
     monkeypatch.setattr(shared, "_case", partial(shared._case, arch="sm120"))
