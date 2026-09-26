@@ -439,17 +439,32 @@ def test_prepared_fp8_empty_thd_resets_amax_without_attention(d, dv, monkeypatch
 
 @pytest.mark.parametrize("output_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("padding", [8, 16])
-def test_fp8_output_pitch_preserves_prepared_and_conversion_routes(output_dtype, padding):
+def test_fp8_output_pitch_preserves_prepared_and_conversion_routes(output_dtype, padding, monkeypatch):
     """One-byte O needs 16-element TMA alignment; other pitches retain conversion."""
     g, vp, ws, bufs, _ = _case(output_dtype=output_dtype, output_padding=padding)
-    assert (g._compiled_plans[g._plan_index]._prepared is not None) == (padding == 16)
+    plan = g._compiled_plans[g._plan_index]
+    assert (plan._prepared is not None) == (padding == 16)
+    prepared_calls = []
+    if padding == 16:
+        execute = plan._prepared.execute
+
+        def record(*args, **kwargs):
+            prepared_calls.append(True)
+            return execute(*args, **kwargs)
+
+        monkeypatch.setattr(plan._prepared, "execute", record)
     g.execute(vp, ws)
+    assert len(prepared_calls) == (1 if padding == 16 else 0)
     _check(bufs, thd=False)
     captured = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(captured):
-        g.execute(vp, ws)
-    bufs["descale_v"].mul_(0.5)
-    bufs["o"].fill_(float("nan"))
-    captured.replay()
-    _check(bufs, thd=False)
-    assert torch.all(bufs["o_storage"][..., 128:] == 12)
+    try:
+        with torch.cuda.graph(captured):
+            g.execute(vp, ws)
+        assert len(prepared_calls) == (2 if padding == 16 else 0)
+        bufs["descale_v"].mul_(0.5)
+        bufs["o"].fill_(float("nan"))
+        captured.replay()
+        _check(bufs, thd=False)
+        assert torch.all(bufs["o_storage"][..., 128:] == 12)
+    finally:
+        captured.reset()
