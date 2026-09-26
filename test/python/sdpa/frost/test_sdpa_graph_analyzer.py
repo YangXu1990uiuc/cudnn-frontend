@@ -232,7 +232,7 @@ def test_prepared_override_capability_declines_legacy_features(feature):
 @pytest.mark.parametrize("arch", ["sm100", "sm120"])
 @pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)])
 def test_prepared_fp8_override_capability_envelope(dtype_o, feature, d_qk, d_v, arch):
-    """Native FP8 dimensions with scalar-scaled outputs use the prepared entry."""
+    """Prepared binding supports existing FP8 head envelopes and SM100 page pools."""
     from dataclasses import replace
 
     graph = _mk_graph()
@@ -253,11 +253,24 @@ def test_prepared_fp8_override_capability_envelope(dtype_o, feature, d_qk, d_v, 
     if feature == "sm107":
         caps = replace(caps, sm_lo=107, sm_hi=119)
     reason = engines._prepared_decline_reason(caps, replace(facts, **changed), 2 if feature == "split" else 1)
-    if feature in ("supported", "split") or (arch == "sm120" and feature == "head_dim"):
+    if feature in ("supported", "split", "head_dim") or (arch == "sm100" and feature == "paged"):
         assert reason is None
     else:
         assert reason is not None
-        assert "prepared FP8" in reason
+        assert "prepared" in reason
+
+
+@pytest.mark.parametrize("d,dv", [(64, 64), (112, 96), (384, 320)])
+def test_prepared_fp8_dense_envelopes_do_not_expand_thd(d, dv):
+    from dataclasses import replace
+
+    graph = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(graph, d=128)
+    o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
+    _finish_output(o, dims, strides)
+    facts = replace(_facts(graph), is_fp8=True, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, d_qk=d, d_v=dv, thd=True)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name(fp8=True))
+    assert "packed native-tile leg" in engines.mismatch(caps, facts)
 
 
 @pytest.mark.parametrize("dtype_o", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2])
