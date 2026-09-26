@@ -41,6 +41,7 @@ def _case(
     output_dtype=torch.bfloat16,
     output_padding=0,
     arch="sm100",
+    split_kv=1,
 ):
     dv = d if dv is None else dv
     torch.manual_seed(827)
@@ -125,7 +126,16 @@ def _case(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(g, engine_name(arch=arch, fp8=True), split_kv=1, **({"pack_gqa": False} if arch == "sm120" else {}))
+    chosen = select_engine(g, engine_name(arch=arch, fp8=True), **({"pack_gqa": False} if arch == "sm120" else {}))
+    if (chosen.knobs.split_kv or 1) != split_kv:
+        from dataclasses import replace
+
+        knobs = replace(chosen.knobs, split_kv=split_kv, sched_policy=0)
+        if arch == "sm100" and (d, dv) == (192, 128) and split_kv > 1:
+            knobs = replace(knobs, cga=2)
+        g.create_execution_plan(chosen.engine_id, knobs)
+        g.select_plan(len(g.plans) - 1)
+    assert (g.plans[g._plan_index].knobs.split_kv or 1) == split_kv
     g.check_support()
     g.build_plans()
     workspace = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)

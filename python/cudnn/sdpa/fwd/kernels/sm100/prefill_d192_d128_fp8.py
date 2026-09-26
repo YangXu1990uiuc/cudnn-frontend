@@ -40,6 +40,7 @@ from cutlass._mlir.dialects import arith
 import cutlass
 from cutlass.experimental import primitives as prims
 import cutlass.cute as cute
+from cudnn.sdpa.fwd.kernels._quantized import _initialize_split_amax, _scale_or_one
 import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls cuda)
 
 from dataclasses import dataclass
@@ -693,12 +694,14 @@ def _kernel(
     descale_q_t: cute.Tensor,
     descale_k_t: cute.Tensor,
     descale_v_t: cute.Tensor,
-    scale_o_t: cute.Tensor,
+    scale_o_t: Optional[cute.Tensor],
     amax_o_tensor: cute.Tensor,
     seq_q_lens_addr: cutlass.Int64 = 0,
     o_partial_f32: Optional[cute.Tensor] = None,
 ) -> None:
 
+    if cutlass.const_expr(CFG.SPLIT_KV > 1):
+        _initialize_split_amax(amax_o_tensor)
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
 
@@ -876,7 +879,7 @@ def _kernel(
         _pre_dsc_q = cutlass.Float32(cutlass.make_array_view(descale_q_t)[0])
         _pre_dsc_k = cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
         _pre_dsc_v = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0])
-        _pre_scl_o = cutlass.Float32(cutlass.make_array_view(scale_o_t)[0])
+        _pre_scl_o = _scale_or_one(scale_o_t)
         scale_softmax_log2 = scale_softmax_log2 * _pre_dsc_q * _pre_dsc_k
         o_scale_fused = o_scale_fused * _pre_dsc_v * _pre_scl_o
 
@@ -947,7 +950,7 @@ def _kernel(
         nvvm.setmaxregister(CFG.CORRECTION_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         if cutlass.const_expr(_ROLE_LOCAL_E4_SCALES):
             _corr_dsc_v = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0])
-            _corr_scl_o = cutlass.Float32(cutlass.make_array_view(scale_o_t)[0])
+            _corr_scl_o = _scale_or_one(scale_o_t)
             o_scale_corr = o_scale_fused * _corr_dsc_v * _corr_scl_o
         else:
             o_scale_corr = o_scale_fused
@@ -2794,7 +2797,7 @@ def _host(
     descale_q_t: cute.Tensor,
     descale_k_t: cute.Tensor,
     descale_v_t: cute.Tensor,
-    scale_o_t: cute.Tensor,
+    scale_o_t: Optional[cute.Tensor],
     amax_o_tensor: cute.Tensor,
     # Dense padded-Q trim: separate (B,)-int32 lengths. None folds the
     # parameter and all consumers out when the specialization is disabled.
@@ -3074,13 +3077,19 @@ from cudnn.sdpa.fwd.kernels.sm100.fp8_host import host as _host_prepared
 # its architecture-specific descriptor lowering and device kernel.
 @lru_cache(maxsize=None)
 def compile_prepared(
-    d_qk: int = CFG.TILE_K, d_v: int = CFG.TILE_O, has_lse: bool = True, lse_kind: str = "dense", paged_hnd: bool = False, has_amax: bool = True
+    d_qk: int = CFG.TILE_K,
+    d_v: int = CFG.TILE_O,
+    has_lse: bool = True,
+    lse_kind: str = "dense",
+    paged_hnd: bool = False,
+    has_amax: bool = True,
+    scale_o_in_combine: bool = False,
 ) -> Callable:
     cache_key = _template_key(globals(), locals(), "compile_prepared")
     from cudnn.sdpa.fwd.kernels.sm100.fp8_host import LSE_KINDS, compile_host
 
-    if PARAMS.paged_kv or SPLIT_KV != 1 or getattr(CFG, "O_BLOCK_SCALE", 0):
-        raise NotImplementedError("prepared FP8 serves unsplit, non-paged scalar-scaled outputs")
+    if PARAMS.paged_kv or getattr(CFG, "O_BLOCK_SCALE", 0):
+        raise NotImplementedError("prepared FP8 serves non-paged scalar-scaled outputs")
     if (d_qk, d_v) != (CFG.TILE_K, CFG.TILE_O):
         raise NotImplementedError("prepared FP8 requires the native head dimensions")
     if lse_kind not in LSE_KINDS:
@@ -3089,4 +3098,4 @@ def compile_prepared(
         raise ValueError("lse_kind 'dense' is the dense form; 'token' / 'head' / 'padded' are the THD forms")
     if paged_hnd:
         raise ValueError("prepared FP8 does not serve paged KV")
-    return compile_host(_host, CFG, STORAGE_DTYPE, OUT_STORAGE_DTYPE, False, cache_key, d_qk, d_v, has_lse, lse_kind, has_amax)
+    return compile_host(_host, CFG, STORAGE_DTYPE, OUT_STORAGE_DTYPE, False, cache_key, d_qk, d_v, has_lse, lse_kind, has_amax, scale_o_in_combine)

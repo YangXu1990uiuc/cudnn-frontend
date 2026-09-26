@@ -150,8 +150,19 @@ def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_s
             raise ValueError(f"cudnn.sdpa: prepared FP8 workspace overlaps {name}")
         if amax < f.ptr + span * width and f.ptr < amax + 4:
             raise ValueError(f"cudnn.sdpa: amax_o overlaps {name}")
+    combine_args = None
     if isinstance(spec, ThdLaunchSpec):
         frame = bind_thd(spec, facts, workspace_ptr, stream, stream_int)
+    elif spec.combine is not None:
+        frame, combine_args = bind_dense_split(spec, facts, workspace_ptr, stream, stream_int)
+        # The quantized combine appends its scalar pointers before the stream;
+        # the half and ragged pointer ABIs remain unchanged.
+        combine_args = (*combine_args[:-1], amax if quant.has_amax else None, patches["scale_o_ptr"], stream)
+        if spec.combine.output_dtype in ("float8_e4m3fn", "float8_e5m2"):
+            # FP8 rounding and scale_o belong to the final combine, once.
+            # The main host None-specializes its scale to one. Avoid an
+            # identity memset (and its captured engine dependency) per call.
+            patches["scale_o_ptr"] = None
     else:
         frame = bind_dense(spec, facts, stream, stream_int)
     if needs_identity:
@@ -162,6 +173,8 @@ def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_s
         if scale_softmax_log2 is not None:
             frame[spec.index["scale_softmax_log2"]] = scale_softmax_log2
         spec.fn(*frame)
+        if combine_args is not None:
+            spec.combine.fn(*combine_args)
     else:
         # No addressable Q token: there is no compiled host launch to reset
         # its reduction output, but Amax_O must still describe the empty O.
@@ -938,6 +951,9 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
             stats_log2=api.stats_log2,
             ragged=s.ragged,
             ragged_i64=s.ragged_i64,
+            quantized=s.quant is not None,
+            has_amax=s.quant.has_amax if s.quant is not None else False,
+            has_scale_o=api._split_scale_o() if s.quant is not None else False,
         )
         fn = positional_entry(owner)
         if fn is None:

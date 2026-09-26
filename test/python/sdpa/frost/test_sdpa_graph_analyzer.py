@@ -150,7 +150,7 @@ def test_fwd_override_legacy_graph_declines_before_lowering(monkeypatch, unsuppo
 @pytest.mark.parametrize("d", [128, 256, 512])
 @pytest.mark.parametrize("opt_in", [False, True])
 def test_sm120_override_admits_prepared_and_declines_legacy_routes(monkeypatch, d, opt_in):
-    """SM120 half and unsplit per-tensor FP8 plans admit overrides; legacy routes decline."""
+    """SM120 half and per-tensor FP8 plans admit overrides; legacy routes decline."""
     from dataclasses import replace
     from unittest.mock import Mock
 
@@ -176,7 +176,7 @@ def test_sm120_override_admits_prepared_and_declines_legacy_routes(monkeypatch, 
     assert engines._prepared_decline_reason(spec.capabilities, replace(facts, thd=True), 1) is None
     fp8 = replace(facts, is_fp8=True)
     assert engines._prepared_decline_reason(spec.capabilities, fp8, 1) is None
-    assert engines._prepared_decline_reason(spec.capabilities, fp8, 2) is not None
+    assert engines._prepared_decline_reason(spec.capabilities, fp8, 2) is None
     for change in (dict(has_paged_kv=True), dict(is_mxfp8=True)):
         assert engines._prepared_decline_reason(spec.capabilities, replace(facts, **change), 1) is not None, change
 
@@ -253,7 +253,7 @@ def test_prepared_fp8_override_capability_envelope(dtype_o, feature, d_qk, d_v, 
     if feature == "sm107":
         caps = replace(caps, sm_lo=107, sm_hi=119)
     reason = engines._prepared_decline_reason(caps, replace(facts, **changed), 2 if feature == "split" else 1)
-    if feature == "supported" or (arch == "sm120" and feature == "head_dim"):
+    if feature in ("supported", "split") or (arch == "sm120" and feature == "head_dim"):
         assert reason is None
     else:
         assert reason is not None
