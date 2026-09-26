@@ -149,8 +149,8 @@ def test_fwd_override_legacy_graph_declines_before_lowering(monkeypatch, unsuppo
 
 @pytest.mark.parametrize("d", [128, 256, 512])
 @pytest.mark.parametrize("opt_in", [False, True])
-def test_sm120_override_admits_prepared_half_and_declines_legacy_routes(monkeypatch, d, opt_in):
-    """SM120 dense, split and THD half plans admit overrides; quantized routes still decline."""
+def test_sm120_override_admits_prepared_and_declines_legacy_routes(monkeypatch, d, opt_in):
+    """SM120 half and unsplit per-tensor FP8 plans admit overrides; legacy routes decline."""
     from dataclasses import replace
     from unittest.mock import Mock
 
@@ -174,7 +174,10 @@ def test_sm120_override_admits_prepared_half_and_declines_legacy_routes(monkeypa
     assert engines._prepared_decline_reason(spec.capabilities, facts, 1) is None
     assert engines._prepared_decline_reason(spec.capabilities, facts, 2) is None
     assert engines._prepared_decline_reason(spec.capabilities, replace(facts, thd=True), 1) is None
-    for change in (dict(has_paged_kv=True), dict(is_fp8=True), dict(is_mxfp8=True)):
+    fp8 = replace(facts, is_fp8=True)
+    assert engines._prepared_decline_reason(spec.capabilities, fp8, 1) is None
+    assert engines._prepared_decline_reason(spec.capabilities, fp8, 2) is not None
+    for change in (dict(has_paged_kv=True), dict(is_mxfp8=True)):
         assert engines._prepared_decline_reason(spec.capabilities, replace(facts, **change), 1) is not None, change
 
 
@@ -226,8 +229,9 @@ def test_prepared_override_capability_declines_legacy_features(feature):
 
 @pytest.mark.parametrize("dtype_o", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2])
 @pytest.mark.parametrize("feature", ["supported", "head_dim", "paged", "split", "block_scaled_output", "gate", "sm107"])
+@pytest.mark.parametrize("arch", ["sm100", "sm120"])
 @pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)])
-def test_prepared_fp8_override_capability_envelope(dtype_o, feature, d_qk, d_v):
+def test_prepared_fp8_override_capability_envelope(dtype_o, feature, d_qk, d_v, arch):
     """Native FP8 dimensions with scalar-scaled outputs use the prepared entry."""
     from dataclasses import replace
 
@@ -236,7 +240,7 @@ def test_prepared_fp8_override_capability_envelope(dtype_o, feature, d_qk, d_v):
     o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
     _finish_output(o, dims, strides)
     facts = replace(_facts(graph), is_fp8=True, dtype=cudnn.data_type.FP8_E4M3, dtype_o=dtype_o, d_qk=d_qk, d_v=d_v)
-    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name())
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name(arch=arch, fp8=True))
     changed = dict(
         supported={},
         head_dim=dict(d_qk=112, d_v=112),
@@ -249,7 +253,7 @@ def test_prepared_fp8_override_capability_envelope(dtype_o, feature, d_qk, d_v):
     if feature == "sm107":
         caps = replace(caps, sm_lo=107, sm_hi=119)
     reason = engines._prepared_decline_reason(caps, replace(facts, **changed), 2 if feature == "split" else 1)
-    if feature == "supported":
+    if feature == "supported" or (arch == "sm120" and feature == "head_dim"):
         assert reason is None
     else:
         assert reason is not None

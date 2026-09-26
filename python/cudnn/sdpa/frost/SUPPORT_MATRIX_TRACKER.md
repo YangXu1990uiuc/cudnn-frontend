@@ -40,7 +40,11 @@ KV-tail masking and bounded runtime geometry. Split partials retain the input
 half dtype; final Stats conversion runs in the common combine. Split plans keep
 the declared batch and Q length, while KV may shrink within its envelope. THD lengths and
 metadata stay on device, including mixed length forms and padded Stats.
-SM120 FP8, block-scaled FP8 outputs, non-native FP8 dimensions, MXFP8,
+SM120/SM121 per-tensor FP8 also supports prepared unsplit dense and THD
+across its general and D512 head envelopes, with device scales, all four scalar
+output dtypes and native KV-tail masking. THD retains per-batch length inputs;
+CU-prefix-sum graph inputs remain unsupported on this FP8 row.
+FP8 split-KV, block-scaled FP8 outputs, non-native SM100 FP8 dimensions, MXFP8,
 synthesized KV-tail padding and bias remain tensor-only and decline overrides;
 explicit opt-in does not bypass the contract. The same pure capability predicate
 filters candidate knobs and selects the prepared executor. Static-geometry graph
