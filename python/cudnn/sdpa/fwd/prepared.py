@@ -541,12 +541,18 @@ def _bind_paged_kv(spec, frame: List[Any], ix: Dict[str, int], facts: Dict[str, 
     _on_plan_device(spec, "paged_attention_v_table", btv)
 
     def table(name, f):
+        if not f.ptr or f.ptr % _ALIGN_F32:
+            raise ValueError(f"cudnn.sdpa: {name} must have a non-null, 4-byte-aligned address")
         if len(f.shape) == 4:  # the graph's (B, 1, max_pages, 1) declaration
+            if int(f.shape[1]) != 1 or int(f.shape[3]) != 1:
+                raise ValueError(f"cudnn.sdpa: {name} must be (B, 1, max_pages, 1); got {f.shape}")
             shape, strides = (int(f.shape[0]), int(f.shape[2])), (int(f.strides[0]), int(f.strides[2]))
         else:
             shape, strides = tuple(int(x) for x in f.shape), tuple(int(x) for x in f.strides)
-        if len(shape) != 2:
-            raise ValueError(f"cudnn.sdpa: " + (f"{name} must be (B, max_pages); got {f.shape}"))
+        if len(shape) != 2 or any(n <= 0 for n in shape):
+            raise ValueError(f"cudnn.sdpa: {name} must be nonempty (B, max_pages); got {f.shape}")
+        if any(st < 0 for st in strides):
+            raise ValueError(f"cudnn.sdpa: {name} requires nonnegative strides; got {strides}")
         return shape, strides
 
     (tb, max_pages), table_strides = table("paged_attention_k_table", bt)
@@ -566,8 +572,11 @@ def _bind_paged_kv(spec, frame: List[Any], ix: Dict[str, int], facts: Dict[str, 
         raise ValueError(f"cudnn.sdpa: " + (f"paged_attention_v_table spans {btv.span} elements; ({b}, {max_pages}) with strides {table_strides} needs {need}"))
     # the pools: (n_pages, KH, page_size, D) containers, head dim contiguous, one page count for K and V,
     # and the in-page layout kind the artifact was compiled for (its TMA descriptors order (row, head) by it)
+    from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
+
+    pool_strides = {}
     for name, f, d in (("k", k, spec.d_qk), ("v", v, spec.d_v)):
-        if len(f.shape) != 4 or int(f.shape[1]) != spec.kh or int(f.shape[2]) != spec.page_size or int(f.shape[3]) != d:
+        if len(f.shape) != 4 or any(n <= 0 for n in f.shape) or int(f.shape[1]) != spec.kh or int(f.shape[2]) != spec.page_size or int(f.shape[3]) != d:
             raise ValueError(f"cudnn.sdpa: " + (f"{name}: a page pool is (n_pages, {spec.kh}, {spec.page_size}, {d}); got {tuple(f.shape)}"))
         if int(f.strides[3]) != 1:
             raise ValueError(f"cudnn.sdpa: " + (f"{name}: the page pool's head dim must be contiguous"))
@@ -575,11 +584,25 @@ def _bind_paged_kv(spec, frame: List[Any], ix: Dict[str, int], facts: Dict[str, 
             raise ValueError(
                 f"cudnn.sdpa: " + (f"{name}: this artifact was compiled for {'HND' if spec.paged_hnd else 'NHD'} page pools; got strides {tuple(f.strides)}")
             )
+        # Reuse the TMA layout rule in storage order. HND exchanges the logical
+        # head/row axes; restore the kernel's (page, row, head) stride order below.
+        # Canonicalizing singleton strides must not weaken observed-span checks.
+        shape, strides = tuple(f.shape), tuple(f.strides)
+        if spec.paged_hnd:
+            shape = (shape[0], shape[2], shape[1], shape[3])
+            strides = (strides[0], strides[2], strides[1], strides[3])
+        bound = dense_bind_strides(shape, strides, _buffers.DTYPE_ITEMSIZE[f.dtype])
+        if bound is None:
+            raise ValueError(f"cudnn.sdpa: {name}: page-pool strides must be covering and 16-byte aligned; got {f.shape} / {f.strides}")
+        bs, ss, hs = (bound[0], bound[2], bound[1]) if spec.paged_hnd else bound
+        need = (int(f.shape[0]) - 1) * bs + (spec.page_size - 1) * ss + (spec.kh - 1) * hs + d
+        if f.span >= 0 and f.span < need:
+            raise ValueError(f"cudnn.sdpa: {name}: page pool spans {f.span} elements; its effective geometry needs {need}")
+        pool_strides[name] = (bs, ss, hs)
     if int(k.shape[0]) != int(v.shape[0]):
         raise ValueError(f"cudnn.sdpa: " + (f"K and V pools must hold the same number of pages; got {k.shape[0]} and {v.shape[0]}"))
     t_kv = max_pages * spec.page_size
-    frame[ix["k_strides"]] = (int(k.strides[0]), int(k.strides[2]), int(k.strides[1]))
-    frame[ix["v_strides"]] = (int(v.strides[0]), int(v.strides[2]), int(v.strides[1]))
+    frame[ix["k_strides"]], frame[ix["v_strides"]] = pool_strides["k"], pool_strides["v"]
     frame[ix["block_table_ptr"]], frame[ix["block_table_v_ptr"]] = bt.ptr, btv.ptr
     frame[ix["table_strides"]] = (int(table_strides[0]), int(table_strides[1]))
     frame[ix["n_pages"]] = int(k.shape[0])

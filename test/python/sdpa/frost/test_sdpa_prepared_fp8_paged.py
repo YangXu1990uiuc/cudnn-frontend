@@ -186,3 +186,28 @@ def test_prepared_fp8_paged_physical_pool_stride_int64(hnd, split, dtype):
         bufs["amax_o"].fill_(999)
         graph.replay()
         _check(bufs)
+
+
+@pytest.mark.parametrize("role", ["k", "v"])
+@pytest.mark.parametrize("defect", ["short_pool", "pool_stride", "table_pointer"])
+def test_prepared_fp8_paged_rejects_invalid_overrides_before_launch(role, defect, monkeypatch):
+    g, vp, ws, bufs, tensors = _case()
+    prepared = g._compiled_plans[g._plan_index]._prepared
+    assert prepared is not None
+    monkeypatch.setattr(prepared.spec, "fn", lambda *a: pytest.fail("invalid paged metadata reached attention"))
+    overrides = {}
+    if defect == "table_pointer":
+        name = role + "_table"
+        vp[tensors[name]] = bufs[name].data_ptr() + 1
+        message = "4-byte-aligned"
+    else:
+        shape, strides = list(bufs[role].shape), list(bufs[role].stride())
+        if defect == "short_pool":
+            shape[0] += 1
+            message = "page pool spans"
+        else:
+            strides[0] += 1
+            message = "16-byte aligned"
+        overrides = dict(override_uids=[tensors[role].get_uid()], override_shapes=[shape], override_strides=[strides])
+    with pytest.raises(ValueError, match=message):
+        g.execute(vp, ws, **overrides)
