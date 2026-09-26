@@ -73,3 +73,19 @@ def test_paged_pool_preserves_wide_strides_and_unknown_capacity(dtype, hnd, obse
     assert frame[ix["k_strides"]][0] == strides[0]
     assert frame[ix["v_strides"]][0] == strides[0]
     assert frame[ix["block_table_ptr"]] == 8196
+
+
+@pytest.mark.parametrize("role", ["k", "v"])
+@pytest.mark.parametrize("defect", ["pool_span", "table_span", "table_pointer"])
+def test_paged_cached_geometry_checks_current_storage(role, defect):
+    spec, ix, pool, table = _fixture()
+    _bind(spec, ix, pool, pool, table)
+    # Repeat identical effective geometry with different per-call storage facts.
+    if defect == "pool_span":
+        bad = pool._replace(span=32767)
+        args = (spec, ix, bad if role == "k" else pool, bad if role == "v" else pool, table)
+    else:
+        bad = table._replace(span=7) if defect == "table_span" else table._replace(ptr=8193)
+        args = (spec, ix, pool, pool, bad if role == "k" else table, bad if role == "v" else table)
+    with pytest.raises(ValueError):
+        _bind(*args)
