@@ -3,6 +3,7 @@
 """Prepared FP8 launches rebind device scales and storage through the public graph API."""
 
 import math
+from contextlib import contextmanager
 
 import pytest
 import torch
@@ -12,6 +13,16 @@ from cudnn.sdpa.fwd.engines import engine_name
 from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell, select_engine
 
 pytestmark = [pytest.mark.L0, requires_dsl, requires_pre_rubin_blackwell]
+
+
+@contextmanager
+def _cuda_graph():
+    """Release the CUDA executable outside later captures, independent of Python GC."""
+    graph = torch.cuda.CUDAGraph()
+    try:
+        yield graph
+    finally:
+        graph.reset()
 
 
 def _case(
@@ -29,6 +40,7 @@ def _case(
     padded=False,
     output_dtype=torch.bfloat16,
     output_padding=0,
+    arch="sm100",
 ):
     dv = d if dv is None else dv
     torch.manual_seed(827)
@@ -51,9 +63,9 @@ def _case(
     if thd:
         for name, seq, h in (("q", sq, hq), ("kv", skv, hk)):
             cu = torch.arange(b + 1, device="cuda", dtype=torch.int32) * seq
-            lens = g.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32, name="cu_" + name)
+            lens = g.tensor(dim=[b if arch == "sm120" else b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32, name="cu_" + name)
             off = g.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32, name="off_" + name)
-            vp[lens], vp[off] = cu, cu * h * d
+            vp[lens], vp[off] = (torch.full((b,), seq, device="cuda", dtype=torch.int32) if arch == "sm120" else cu), cu * h * d
             tensors["cu_" + name], tensors["off_" + name] = lens, off
             for role in (("q",) if name == "q" else ("k", "v")):
                 tensors[role].set_ragged_offset(off)
@@ -61,7 +73,7 @@ def _case(
                 off_v = g.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32, name="off_v")
                 tensors["v"].set_ragged_offset(off_v)
                 tensors["off_v"], vp[off_v] = off_v, cu * hk * dv
-            kwargs["cu_seq_len_" + name] = lens
+            kwargs[("seq_len_" if arch == "sm120" else "cu_seq_len_") + name] = lens
         kwargs["use_padding_mask"] = True
     for name, val in (("descale_q", 0.8), ("descale_k", 0.9), ("descale_v", 0.7), ("descale_s", 1.0), ("scale_s", 1.0), ("scale_o", 1.3)):
         t = g.tensor(dim=[1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.FLOAT, name=name)
@@ -113,7 +125,7 @@ def _case(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(g, engine_name(fp8=True), split_kv=1)
+    select_engine(g, engine_name(arch=arch, fp8=True), split_kv=1, **({"pack_gqa": False} if arch == "sm120" else {}))
     g.check_support()
     g.build_plans()
     workspace = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
@@ -202,24 +214,24 @@ def test_prepared_fp8_capture_replay_reads_current_scales(thd, monkeypatch, d, d
     monkeypatch.setattr(cute, "compile", lambda *a, **k: pytest.fail("execute must not compile"))
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        torch.cuda.set_sync_debug_mode("error")
-        try:
-            before = torch.cuda.memory_stats()["allocation.all.allocated"]
-            g.execute(vp, ws)
-            assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
-        finally:
-            torch.cuda.set_sync_debug_mode("default")
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            g.execute(vp, ws)
-    torch.cuda.current_stream().wait_stream(stream)
-    for value in (0.4, 1.1):
-        bufs["descale_v"].fill_(value)
-        bufs["o"].fill_(float("nan"))
-        bufs["amax_o"].fill_(999)
-        graph.replay()
-        _check(bufs, thd=thd)
+    with _cuda_graph() as graph:
+        with torch.cuda.stream(stream):
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                before = torch.cuda.memory_stats()["allocation.all.allocated"]
+                g.execute(vp, ws)
+                assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+            with torch.cuda.graph(graph, stream=stream):
+                g.execute(vp, ws)
+        torch.cuda.current_stream().wait_stream(stream)
+        for value in (0.4, 1.1):
+            bufs["descale_v"].fill_(value)
+            bufs["o"].fill_(float("nan"))
+            bufs["amax_o"].fill_(999)
+            graph.replay()
+            _check(bufs, thd=thd)
 
 
 @pytest.mark.parametrize("thd", [False, True])
@@ -344,36 +356,40 @@ def test_prepared_fp8_accepts_declared_bare_scalar_pointers(thd):
 @pytest.mark.gpu_exclusive
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
-def test_prepared_fp8_thd_output_row_stride_above_int32(dtype, d, dv):
+def test_prepared_fp8_thd_output_row_stride_above_int32(dtype, d, dv, thd=True):
     """The Int64 host ABI must not narrow again in device-side descriptor setup."""
     row_stride = 2**32 + 4 * dv
     if torch.cuda.mem_get_info()[0] < 2 * row_stride + 2**30:
         pytest.skip("wide physical row-stride regression needs 9 GiB free")
-    g, vp, ws, bufs, tensors = _case(d=d, dv=dv, thd=True, override=True, dtype=dtype, sq=1, skv=64)
+    g, vp, ws, bufs, tensors = _case(d=d, dv=dv, thd=thd, override=True, dtype=dtype, sq=1, skv=64)
     plan = g._compiled_plans[g._plan_index]
     assert plan._prepared is not None
     owner = plan._prepared.spec.owner
     try:
-        bufs["o"] = torch.empty_strided((2, 4, dv), (row_stride, dv, 1), device="cuda", dtype=torch.bfloat16)
+        shape = (2, 4, dv) if thd else (2, 4, 1, dv)
+        strides = (row_stride, dv, 1) if thd else (row_stride, dv, 4 * dv, 1)
+        bufs["o"] = torch.empty_strided(shape, strides, device="cuda", dtype=torch.bfloat16)
     except torch.OutOfMemoryError:
         # A concurrent pytest worker may consume memory after the precheck.
         # Numerical failures and launch errors remain outside this guard.
         pytest.skip("wide physical row-stride storage unavailable under current GPU memory pressure")
     vp[tensors["o"]] = bufs["o"]
-    overrides = dict(override_uids=[tensors["o"].get_uid()], override_shapes=[[2, 4, 1, dv]], override_strides=[[4 * dv, dv, row_stride, 1]])
+    overrides = dict(
+        override_uids=[tensors["o"].get_uid()], override_shapes=[[2, 4, 1, dv]], override_strides=[[4 * dv, dv, row_stride, 1] if thd else list(strides)]
+    )
     bufs["o"].fill_(float("nan"))
     g.execute(vp, ws, **overrides)
-    _check(bufs, thd=True, sq=1, skv=64)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        g.execute(vp, ws, **overrides)
-    bufs["descale_v"].fill_(0.3)
-    bufs["o"].fill_(float("nan"))
-    bufs["lse"].fill_(float("nan"))
-    bufs["amax_o"].fill_(999)
-    graph.replay()
-    _check(bufs, thd=True, sq=1, skv=64)
-    assert plan._prepared.spec.owner is owner
+    _check(bufs, thd=thd, sq=1, skv=64)
+    with _cuda_graph() as graph:
+        with torch.cuda.graph(graph):
+            g.execute(vp, ws, **overrides)
+        bufs["descale_v"].fill_(0.3)
+        bufs["o"].fill_(float("nan"))
+        bufs["lse"].fill_(float("nan"))
+        bufs["amax_o"].fill_(999)
+        graph.replay()
+        _check(bufs, thd=thd, sq=1, skv=64)
+        assert plan._prepared.spec.owner is owner
 
 
 @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
@@ -404,13 +420,13 @@ def test_prepared_fp8_dense_input_strides(d, dv):
     assert g._compiled_plans[g._plan_index]._prepared is not None
     g.execute(vp, ws)
     _check(bufs, thd=False)
-    captured = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(captured):
-        g.execute(vp, ws)
-    bufs["descale_k"].fill_(1.5)
-    bufs["o"].fill_(float("nan"))
-    captured.replay()
-    _check(bufs, thd=False)
+    with _cuda_graph() as captured:
+        with torch.cuda.graph(captured):
+            g.execute(vp, ws)
+        bufs["descale_k"].fill_(1.5)
+        bufs["o"].fill_(float("nan"))
+        captured.replay()
+        _check(bufs, thd=False)
 
 
 @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
@@ -429,12 +445,12 @@ def test_prepared_fp8_empty_thd_resets_amax_without_attention(d, dv, monkeypatch
     bufs["amax_o"].fill_(999)
     g.execute(vp, ws)
     torch.testing.assert_close(bufs["amax_o"], torch.zeros_like(bufs["amax_o"]))
-    captured = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(captured):
-        g.execute(vp, ws)
-    bufs["amax_o"].fill_(999)
-    captured.replay()
-    torch.testing.assert_close(bufs["amax_o"], torch.zeros_like(bufs["amax_o"]))
+    with _cuda_graph() as captured:
+        with torch.cuda.graph(captured):
+            g.execute(vp, ws)
+        bufs["amax_o"].fill_(999)
+        captured.replay()
+        torch.testing.assert_close(bufs["amax_o"], torch.zeros_like(bufs["amax_o"]))
 
 
 @pytest.mark.parametrize("output_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
@@ -456,8 +472,7 @@ def test_fp8_output_pitch_preserves_prepared_and_conversion_routes(output_dtype,
     g.execute(vp, ws)
     assert len(prepared_calls) == (1 if padding == 16 else 0)
     _check(bufs, thd=False)
-    captured = torch.cuda.CUDAGraph()
-    try:
+    with _cuda_graph() as captured:
         with torch.cuda.graph(captured):
             g.execute(vp, ws)
         assert len(prepared_calls) == (2 if padding == 16 else 0)
@@ -466,5 +481,3 @@ def test_fp8_output_pitch_preserves_prepared_and_conversion_routes(output_dtype,
         captured.replay()
         _check(bufs, thd=False)
         assert torch.all(bufs["o_storage"][..., 128:] == 12)
-    finally:
-        captured.reset()

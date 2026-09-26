@@ -11,24 +11,9 @@ from cuda.bindings import driver as _cuda_driver
 
 from cudnn.frost.compiled_cache import compile_cached as _compile_cached
 from cudnn.sdpa.fwd.kernels._common_blackwell import sdpa_operand_tensors
+from cudnn.sdpa.fwd.kernels._quantized import _reset_amax_kernel, _unscale_amax_kernel
 
 LSE_KINDS = ("dense", "token", "head", "padded")
-
-
-@cute.kernel
-def _reset_amax_kernel(amax: cute.Pointer):
-    amax.store(cutlass.Float32(0.0))
-
-
-_reset_amax_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
-
-
-@cute.kernel
-def _unscale_amax_kernel(amax: cute.Pointer, scale: cute.Pointer):
-    amax.store(amax.load() / scale.load())
-
-
-_unscale_amax_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit

@@ -138,6 +138,16 @@ reaches a kernel; prove RED before the fix. Also exercise disjoint slices of one
 allocation so rejecting shared ownership does not substitute for checking overlap.
 Device pointer-table contents remain a caller contract, not a reason for a D2H read.
 
+### CUDA Graph test lifetimes
+
+Explicitly reset a test-owned CUDA Graph after replay verification, using a
+`finally` block or context manager. Python reference cycles can defer its CUDA
+executable destruction until GC runs inside a later test's capture, invalidating
+that capture. The SM120 FP8 prepared suite reproduced this when the D128
+strided-input graph was collected during the D384x320 case; tracing
+`CUDAGraph.__del__` identified both tests. Keep capture error mode unchanged and
+fix ownership instead of disabling GC or treating a retry as validation.
+
 ### Prepared quantized launch probes
 
 Rebind scale buffers with different values, not only cloned storage: identical
