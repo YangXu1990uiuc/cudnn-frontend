@@ -1812,6 +1812,54 @@ def test_sm90_d128_declined_graphs_trail(monkeypatch, over, want):
     assert placement.place(spec, _facts(**{**shape, **over})) == want
 
 
+_SM90_BIAS = dict(
+    b=4,
+    h_q=16,
+    h_kv=16,
+    s_q=1024,
+    s_kv=1024,
+    d_qk=128,
+    d_v=128,
+    dtype=cudnn.data_type.BFLOAT16,
+    causal=False,
+    bottom_right=False,
+    device_cc=(9, 0),
+    device_sm_count=132,
+    has_bias=True,
+    bias_dtype=cudnn.data_type.BFLOAT16,
+)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over, want",
+    [
+        pytest.param({}, placement.LEAD, id="d128-mha"),
+        pytest.param(dict(h_q=32, h_kv=8, causal=True, bottom_right=True), placement.LEAD, id="d128-gqa-causal"),
+        pytest.param(dict(s_q=32, s_kv=32), placement.LEAD, id="d128-sq32"),
+        pytest.param(dict(s_q=512, s_kv=2048), placement.LEAD, id="d128-cross"),
+        pytest.param(dict(dtype=cudnn.data_type.HALF, bias_dtype=cudnn.data_type.HALF), placement.LEAD, id="d128-f16"),
+        pytest.param(dict(d_qk=256, d_v=256, h_q=32, h_kv=8, causal=True, bottom_right=True), placement.LEAD, id="d256-gqa-causal"),
+        pytest.param(dict(s_q=16, s_kv=16), placement.TRAIL, id="below-sq32"),
+        pytest.param(dict(bias_dtype=cudnn.data_type.FLOAT), placement.TRAIL, id="fp32-bias"),
+        pytest.param(dict(s_q=512, s_kv=2048, causal=True), placement.TRAIL, id="causal-off-square"),
+        pytest.param(dict(causal=True, bottom_right=True, window_left=256), placement.TRAIL, id="window"),
+        pytest.param(dict(has_sink=True), placement.TRAIL, id="sink"),
+        pytest.param(dict(has_dropout=True), placement.TRAIL, id="dropout"),
+        pytest.param(dict(d_qk=192, d_v=128), placement.TRAIL, id="d192x128"),
+        pytest.param(dict(has_bias=False, bias_dtype=None, s_q=128, s_kv=8192), placement.TRAIL, id="bias-free-hand-rule"),
+    ],
+)
+def test_sm90_bias_follows_its_study(over, want):
+    """Study sm90_bias_fwd_20261123 (module docstring): a dense exact d128 / d256 graph with a bias in the Q/K/V dtype, unmasked or
+    causal on a square, leads from SM90_BIAS_MIN_S_Q query rows; every graph outside that measured domain keeps the rules it had
+    (the backend first for a biased d128 / d256 graph). Default placement: the FROST flag unset (Rule S12)."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_sm90_f16_three_wg")
+    assert placement.place(spec, _facts(**{**_SM90_BIAS, **over})) == want
+
+
 @pytest.mark.L0
 def test_sm90_d128_default_placement_reads_its_study(monkeypatch):
     """Study sm90_d128_h100_refit_20261114: the SM90 row's exact dense d128 graphs the D128 template serves are placed by their class's generated

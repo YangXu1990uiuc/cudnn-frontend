@@ -51,12 +51,13 @@ SM100_WINDOW_PREFILL_MIN_S_Q = 256  # the smallest S_q the SM100 windowed packin
 (SM120: the two-kernel dS / dQ split), so those graphs neither share the default classes' entries nor count as unmeasured."""
 
 
-def _unmeasured(facts, row: Optional[str] = None) -> bool:
-    """Features no study sweeps: such a graph keeps the hand-written rules."""
+def _unmeasured(facts, row: Optional[str] = None, *, bias_measured: bool = False) -> bool:
+    """Features no study sweeps: such a graph keeps the hand-written rules. ``bias_measured`` asks about every feature but
+    an additive bias, for a hand rule that measured biased graphs itself (``placement._sm90_bias_lead``)."""
     return bool(
         getattr(facts, "is_fp8", False)
         or getattr(facts, "is_mxfp8", False)
-        or facts.has_bias
+        or (facts.has_bias and not bias_measured)
         or facts.has_dropout
         or getattr(facts, "has_score_mod", False)
         or getattr(facts, "has_alibi", False)

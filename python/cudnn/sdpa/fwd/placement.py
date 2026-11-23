@@ -155,6 +155,14 @@ template does not serve (THD, paged KV, split, packed, sink, window, ``s_q == 1`
 ``s_q > s_kv``) runs the 64 x 64 tile, the D512 body at head_tile 128 (about 2.3x the backend's time at the median)
 -> TRAIL.
 
+SM90 f16/bf16 row, dense exact d128 and d256 with an additive bias in the Q/K/V dtype (``_sm90_bias_lead``), study
+``sm90_bias_fwd_20261123`` (H200, cuDNN 9.24.0.43; b 1-16, S_q 32-8192 on and off the tile, S_kv = S_q or 2-4x S_q
+unmasked, top-left causal on squares, every broadcast form of the bias, Stats on and off, BF16 and FP16; 640 train
+cells, a 164-cell holdout of new head pairs scored once): FROST ran at or below the backend's time on every cell --
+train 0.35-0.97, holdout geomean 0.58-0.69 per class, worst 0.90 -> LEAD. FP32 bias (geomean 0.95-1.21 at d128), windows,
+sinks, paged or THD K/V, causal off the square and S_q below ``SM90_BIAS_MIN_S_Q`` were not measured -> the rules
+above, as before.
+
 SM100 per-tensor FP8 row (B200, E4M3 Q/K/V/O, Amax_O; FROST does not produce Amax_S, so graphs
 requesting it keep the backend): prefill d256 0.47-0.58 and d512 0.34-0.49 -> LEAD; d192 0.92-0.99 and
 d128 0.98-1.03 squares -> TRAIL. ``s_q == 1``: d128 loses 1.3-2.7x; for d192-d512 the backend has no
@@ -656,6 +664,7 @@ _SM120_PAGED_WINDOW_SQ1_D192_CLASS = ("sdpa_fwd_prefill_sm120", (12, 0), "bf16",
 SM90_SQ1_MIN_Q_ROWS = 512  # s_q == 1 (no split-KV on SM90): b * h_q >= 512 wins 0.25-0.95; 256 is parity, below loses up to 33x
 SM90_D128_MHA_TRAIL_MAX_SQ = 128  # exact dense d128, MHA with s_q <= 128 (memory-bound): 1.03 of the backend's time
 SM90_D128_MHA_TRAIL_MAX_L = 3.5  # exact dense d128, causal MHA with at most 3.5 KV tiles per Q tile: 1.00-1.06
+SM90_BIAS_MIN_S_Q = 32  # biased dense d128 / d256: the smallest query length study sm90_bias_fwd_20261123 timed
 D512_SWA_MIN_S_Q = 128  # d512 sliding-window prefill: measured from this query length ...
 D512_SWA_MIN_KV = 1024  # ... and this cache length (B200 / H100 / Rubin 0.18-0.97, module docstring)
 
@@ -1551,7 +1560,28 @@ def _place_sm90_d128(facts) -> str:
     return LEAD
 
 
+def _sm90_bias_lead(facts) -> bool:
+    """A dense exact d128 / d256 graph with an additive bias in the Q/K/V dtype, unmasked or causal on a square, from
+    ``SM90_BIAS_MIN_S_Q`` query rows (module docstring, study ``sm90_bias_fwd_20261123``). FROST runs it on the D128
+    template (engine 20541) from config_sm90.D128_LEAD_MIN_SQ query rows, else on the three-WG body (engine 20540)."""
+    from cudnn.sdpa import placement_table
+
+    return bool(
+        facts.has_bias
+        and facts.bias_dtype == facts.dtype
+        and (facts.d_qk, facts.d_v) in ((128, 128), (256, 256))
+        and not placement_table._unmeasured(facts, "sdpa_fwd_prefill_sm90", bias_measured=True)
+        and not (facts.thd or facts.has_paged_kv or facts.padded or facts.has_kv_mask or facts.has_sink or facts.window_left is not None)
+        and not (facts.causal and facts.s_q != facts.s_kv)
+        and facts.s_q >= SM90_BIAS_MIN_S_Q
+        and facts.h_kv
+        and facts.h_q % facts.h_kv == 0
+    )
+
+
 def _place_sm90_f16(caps: Capabilities, facts) -> str:
+    if _sm90_bias_lead(facts):
+        return LEAD
     if (facts.d_qk, facts.d_v) == (128, 128):
         from cudnn.sdpa import placement_table
 
