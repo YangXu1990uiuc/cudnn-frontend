@@ -1681,6 +1681,41 @@ def test_fp8_sink_split_is_proposed_where_mismatch_admits_it(row, device_cc, d, 
     assert mismatch(caps, facts, SdpaFwdKnobs(tile_m=128, tile_n=128, cga=1, pack_gqa=True, split_kv=points[0])) is None
 
 
+def test_sm80_half_sink_split_is_proposed_over_the_whole_cache():
+    """The SM80 half split folds a sink once in its combine (#2399), so the chooser proposes it for a sink graph over the whole cache
+    as it does without one (study sm80_sink_split_20261128: one gpt-oss request over a 128k cache ran 4.4 ms unsplit on A100); a
+    windowed sink graph keeps the unsplit plan. 8/1 over 131072 keys is one packed unit on a 108-SM part."""
+    from dataclasses import replace
+
+    import cudnn
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+    from cudnn.sdpa.fwd.heuristics import _split_points
+
+    caps = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_sm80_f16_k_prefetch").capabilities
+    facts = ga.SdpaGraphFacts(
+        b=1,
+        h_q=8,
+        h_kv=1,
+        s_q=1,
+        s_kv=131072,
+        d_qk=64,
+        d_v=64,
+        dtype=cudnn.data_type.BFLOAT16,
+        has_sink=True,
+        has_paged_kv=True,
+        page_size=16,
+        padded=True,
+        device_sm_count=108,
+        device_cc=(8, 0),
+    )
+    points = _split_points(caps, facts, 128, 64, 1, 8)
+    assert points[0] > 1 and points[-1] == 1, points
+    assert points == _split_points(caps, replace(facts, has_sink=False), 128, 64, 1, 8)
+    assert mismatch(caps, facts, SdpaFwdKnobs(pack_gqa=True, split_kv=points[0])) is None
+    assert _split_points(caps, replace(facts, window_left=128, causal=True, bottom_right=True), 128, 64, 1, 8) == [1]
+
+
 def test_mxfp8_sink_keeps_the_unsplit_plan():
     from dataclasses import replace
 

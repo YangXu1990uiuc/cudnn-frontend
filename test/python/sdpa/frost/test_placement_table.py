@@ -592,8 +592,9 @@ def test_sm80_paged_wide_head_verify_follows_its_study(s_kv):
 @pytest.mark.parametrize("window_left", [None, 128], ids=["causal", "window"])
 @pytest.mark.parametrize("s_kv", [131072, 131071], ids=["on_tile", "off_tile"])
 def test_sm80_paged_d64_sink_mtp_follows_its_study(window_left, s_kv):
-    """Study sm80_paged_mtp_sink_20261117 (A100, gpt-oss's paged generation graph): d64 sink MTP rows lead once enough tiles are in
-    flight and keep the backend at b 1; f16 and another part keep the hand rules (no sink: sm80_gen_gaps_20261117)."""
+    """Study sm80_paged_mtp_sink_20261117 (A100, gpt-oss's paged generation graph): windowed d64 sink MTP rows lead once enough tiles
+    are in flight and keep the backend at b 1. Over the whole cache the row splits these graphs and they lead at every launch size
+    (study sm80_sink_split_20261128). f16 and another part keep the hand rules (no sink: sm80_gen_gaps_20261117)."""
     row = "sdpa_fwd_prefill_sm80"
 
     def mtp(**over):
@@ -602,11 +603,12 @@ def test_sm80_paged_d64_sink_mtp_follows_its_study(window_left, s_kv):
         base.update(over)
         return _facts(**base)
 
+    study = "sm80_paged_mtp_sink_20261117" if window_left is not None else "sm80_sink_split_20261128"
     for b in (8, 128):
         assert pt.lookup(row, mtp(b=b)) is True, b
-        assert pt.matched_entry(row, mtp(b=b)).study == "sm80_paged_mtp_sink_20261117"
-    assert pt.lookup(row, mtp(b=1, h_q=8, h_kv=1)) is False
-    assert pt.matched_entry(row, mtp(b=1, h_q=8, h_kv=1)).study == "sm80_paged_mtp_sink_20261117"
+        assert pt.matched_entry(row, mtp(b=b)).study == study
+    assert pt.lookup(row, mtp(b=1, h_q=8, h_kv=1)) is (window_left is None)
+    assert pt.matched_entry(row, mtp(b=1, h_q=8, h_kv=1)).study == study
     assert pt.matched_entry(row, mtp(has_sink=False)).study == "sm80_gen_gaps_20261117"  # no sink: the generation-gaps study
     assert pt.lookup(row, mtp(dtype=cudnn.data_type.HALF)) is None
     assert pt.lookup(row, mtp(device_cc=(8, 6))) is None

@@ -1775,12 +1775,10 @@ TABLE: Dict[Tuple, Entry] = {
     # study sm80_paged_mtp_sink_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE 9bdf9a8ab; the same generation graph, paged page 16,
     # d64 with a sink, full and 128-key window, s_q 2-4, b 1-128, KV 4k-128k; 280 train cells, a 60-cell seeded holdout scored once:
     # the four classes moved 47 cells at 0.29-0.41 geomean, worst 1.07). The a100 nightly (run-547) had gpt-oss paged MTP at 3.9-8.4x.
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "mtp", "paged", "causal_br", True, "gqa", False): Entry(
-        "ge", 3.5, "sm80_paged_mtp_sink_20261117", "tiles"
-    ),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "mtp", "paged", "causal_br", True, "gqa", True): Entry(
-        "ge", 4.0, "sm80_paged_mtp_sink_20261117", "tiles"
-    ),
+    # Its full-cache entries were refit by study sm80_sink_split_20261128 (A100 80GB PCIe 300 W, cuDNN 9.24.0.43) once the row split
+    # these graphs: FROST leads at every launch size (train 120 changed cells at 0.097-0.103, holdout at fresh head pairs 15 at 0.106).
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "mtp", "paged", "causal_br", True, "gqa", False): Entry("always", None, "sm80_sink_split_20261128"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "mtp", "paged", "causal_br", True, "gqa", True): Entry("always", None, "sm80_sink_split_20261128"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "mtp", "paged", "window", True, "gqa", False): Entry(
         "ge", 2.5, "sm80_paged_mtp_sink_20261117", "tiles"
     ),
@@ -2386,7 +2384,8 @@ TABLE: Dict[Tuple, Entry] = {
         "always", None, "sm90_d64_sink_mtp_20261118"
     ),
     # study sm90_d64_sink_mtp_longkv_20261128 (H100 700 W, cuDNN 9.24.0.43; the parent's full-cache cells pooled with 738 cells at
-    # 24k-96k keys, holdout at fresh head pairs scored once): the same graphs from SM90_D64_SINK_MTP_LONG_KV keys lead at every launch size
+    # 24k-96k keys, holdout at fresh head pairs scored once: 42 changed at 0.853): the same graphs from SM90_D64_SINK_MTP_LONG_KV keys
+    # lead at every launch size
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (64, 64), "mtp_long_kv", "paged", "causal_br", True, "gqa_unpacked", False): Entry(
         "always", None, "sm90_d64_sink_mtp_longkv_20261128"
     ),

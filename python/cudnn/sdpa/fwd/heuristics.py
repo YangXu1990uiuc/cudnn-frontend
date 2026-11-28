@@ -2899,10 +2899,10 @@ def _split_points(
         return [no_split]
     # Paged KV is padded by construction and the split composes with the
     # per-batch lengths (it IS the decode lever there) — see mismatch().
-    # A sink splits on the SM100 / SM120 half flavors and, over the whole cache, on the per-tensor
-    # FP8 plans mismatch() admits (the combine folds it once). Under a window the FP8 model counts
-    # the whole cache, so a windowed FP8 sink graph keeps the unsplit plan; MXFP8 keeps it too, and
-    # a gated graph's split (the gate rides its combine) carries no sink.
+    # A sink splits on the SM100 / SM120 half flavors, on the SM80 half flavors over the whole cache, and,
+    # over the whole cache, on the per-tensor FP8 plans mismatch() admits (the combine folds it once).
+    # Under a window the FP8 model counts the whole cache, so a windowed FP8 sink graph keeps the
+    # unsplit plan; MXFP8 keeps it too, and a gated graph's split (the gate rides its combine) carries no sink.
     if (
         (facts.thd and not ragged_decode)
         or (
@@ -2919,9 +2919,11 @@ def _split_points(
                     )
                 )
                 or facts.has_epilogue_gate
-                or caps.sm_lo not in (100, 107, 120)
+                or caps.sm_lo not in (80, 100, 107, 120)
                 # cc 10.7: a window already bounds the KV walk, and the split's combine measured slower there (sink-split study 2026-11-01)
                 or (caps.sm_lo == 107 and facts.window_left is not None)
+                # SM80: windowed sink splits are unmeasured (sm80_sink_split_20261128 timed the whole cache)
+                or (caps.sm_lo == 80 and facts.window_left is not None)
             )
         )
         or (facts.padded and not facts.has_paged_kv)
