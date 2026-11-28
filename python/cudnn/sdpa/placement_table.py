@@ -386,6 +386,20 @@ def _sm107_thd_split(row: str, facts) -> bool:
     return heuristics.nonpaged_thd_split_choice(caps, facts)[0] > 1
 
 
+SM90_D64_SINK_MTP_LONG_KV = 32768  # SM90 d64 paged sink MTP over the full cache keys `mtp_long_kv` from this many keys
+
+
+def _sm90_sink_mtp_long_kv(row: str, facts) -> bool:
+    """SM90 d64 paged MTP with a sink over a long full cache, GQA the row runs unpacked (gpt-oss). Past a few tiles FROST against the
+    backend follows the cache length, not the launch size: it loses some short-cache launches and no long-cache one, so one threshold
+    cannot keep the long caches together with the small launches, which it wins at every length (study sm90_d64_sink_mtp_longkv_20261128)."""
+    if row != "sdpa_fwd_prefill_sm90" or not facts.has_paged_kv or (facts.d_qk, facts.d_v) != (64, 64):
+        return False
+    if not facts.has_sink or facts.window_left is not None or facts.h_q == facts.h_kv:
+        return False
+    return facts.s_kv >= SM90_D64_SINK_MTP_LONG_KV and _unpacked_decode(row, facts)
+
+
 _VERIFY_ROWS = frozenset({"sdpa_fwd_prefill_sm80", "sdpa_fwd_prefill_sm90"})
 _VERIFY_MAX_S_Q = 16  # placement.DECODE_SHAPED_MAX_S_Q: the spec-decode verify depth
 
@@ -417,6 +431,8 @@ def class_key(row: str, facts, verify: bool = True) -> Optional[Tuple]:
         phase = "verify"
     else:
         phase = "prefill"
+    if phase == "mtp" and _sm90_sink_mtp_long_kv(row, facts):
+        phase = "mtp_long_kv"
     bounded = bool(getattr(facts, "shape_overrides", False))
     sm100_paged_d64 = row == "sdpa_fwd_prefill_sm100" and facts.has_paged_kv and (facts.d_qk, facts.d_v) == (64, 64)
     if phase == "prefill" and facts.s_q <= 128 and (bounded or sm100_paged_d64):
@@ -2368,6 +2384,14 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (64, 64), "mtp", "paged", "window", True, "gqa_unpacked", True): Entry(
         "always", None, "sm90_d64_sink_mtp_20261118"
+    ),
+    # study sm90_d64_sink_mtp_longkv_20261128 (H100 700 W, cuDNN 9.24.0.43; the parent's full-cache cells pooled with 738 cells at
+    # 24k-96k keys, holdout at fresh head pairs scored once): the same graphs from SM90_D64_SINK_MTP_LONG_KV keys lead at every launch size
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (64, 64), "mtp_long_kv", "paged", "causal_br", True, "gqa_unpacked", False): Entry(
+        "always", None, "sm90_d64_sink_mtp_longkv_20261128"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (64, 64), "mtp_long_kv", "paged", "causal_br", True, "gqa_unpacked", True): Entry(
+        "always", None, "sm90_d64_sink_mtp_longkv_20261128"
     ),
     # study sm100_d192x128_paged_924_20261123 (B200 1000 W / B300 1100 W, cuDNN 9.24.0.43 only; sm100_d192x128_paged_v2_20261118's 9.24
     # cells plus a lower-edge supplement as train, holdout at fresh head pairs scored once): mimo full paged d192 x 128 context leads

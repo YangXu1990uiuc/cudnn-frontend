@@ -1682,7 +1682,7 @@ def test_sm107_paged_unpacked_cga_tile_keys_apart(monkeypatch):
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     spec = sm100_legacy_policy_spec("sdpa_fwd_prefill_sm107")
-    lo, hi, sms = *pt.SM107_PAGED_CGA_TILE_S_Q, 208
+    (lo, hi), sms = pt.SM107_PAGED_CGA_TILE_S_Q, 208
     study = "rubin_paged_unpacked_waves_20261128"
     base = dict(b=1, h_q=24, h_kv=8, s_q=hi, s_kv=8192, page_size=64, max_total_seq_len_q=hi, device_sm_count=sms)
     f = lambda **over: _sm107_paged_facts(**{**base, **over})

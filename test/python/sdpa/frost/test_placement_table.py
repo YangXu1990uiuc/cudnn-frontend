@@ -58,6 +58,7 @@ def test_entries_are_well_formed_and_name_known_rows():
         assert phase.removesuffix("_det") in (
             "q1",
             "mtp",
+            "mtp_long_kv",
             "verify",
             "prefill",
             "prefill_short_square",
@@ -1845,8 +1846,32 @@ def test_sm90_d192x128_dense_sink_verify_v2_entries_follow_the_study():
 @pytest.mark.L0
 def test_sm90_d64_sink_mtp_entries_follow_the_study():
     """Study sm90_d64_sink_mtp_20261118 (H100): gpt-oss paged d64 MTP with a sink, which SM90 runs unpacked, leads with a window always
-    and with the full cache up to 2^4.5 parallel tiles, on and off the KV tile."""
+    and, below SM90_D64_SINK_MTP_LONG_KV keys, with the full cache up to 2^4.5 parallel tiles, on and off the KV tile."""
     row = "sdpa_fwd_prefill_sm90"
+
+    def mtp(**over):
+        base = dict(b=1, h_q=64, h_kv=8, s_q=3, s_kv=16384, d_qk=64, d_v=64, causal=True, bottom_right=True, has_sink=True, device_cc=(9, 0))
+        base.update(has_paged_kv=True, page_size=16, padded=True)
+        base.update(over)
+        return _facts(**base)
+
+    study = "sm90_d64_sink_mtp_20261118"
+    for kv in (16384, 16385):
+        assert pt.class_key(row, mtp(s_kv=kv))[4] == "mtp" and pt.class_key(row, mtp(s_kv=kv))[8] == "gqa_unpacked"
+        assert pt.lookup(row, mtp(s_kv=kv)) is True and pt.matched_entry(row, mtp(s_kv=kv)).study == study
+        assert pt.lookup(row, mtp(s_kv=kv, b=128, h_q=8, h_kv=1)) is False  # 128 parallel tiles: past the full-cache floor
+    for kv in (16384, 131072, 131073):
+        assert pt.lookup(row, mtp(s_kv=kv, b=128, h_q=8, h_kv=1, window_left=127)) is True
+        assert pt.matched_entry(row, mtp(s_kv=kv, window_left=127)).study == study
+
+
+@pytest.mark.L0
+def test_sm90_d64_sink_mtp_long_cache_keys_apart():
+    """Study sm90_d64_sink_mtp_longkv_20261128 (H100): from SM90_D64_SINK_MTP_LONG_KV keys, gpt-oss paged d64 MTP with a sink over the
+    full cache keys `mtp_long_kv` and leads at every launch size, on and off the KV tile. Windows, MHA, single-row decode, verify depth,
+    graphs without a sink and other rows keep their classes."""
+    row = "sdpa_fwd_prefill_sm90"
+    long_kv = pt.SM90_D64_SINK_MTP_LONG_KV
 
     def mtp(**over):
         base = dict(b=1, h_q=64, h_kv=8, s_q=3, s_kv=131072, d_qk=64, d_v=64, causal=True, bottom_right=True, has_sink=True, device_cc=(9, 0))
@@ -1854,12 +1879,19 @@ def test_sm90_d64_sink_mtp_entries_follow_the_study():
         base.update(over)
         return _facts(**base)
 
-    study = "sm90_d64_sink_mtp_20261118"
-    for kv in (131072, 131073):
-        assert pt.class_key(row, mtp(s_kv=kv))[8] == "gqa_unpacked"
-        assert pt.lookup(row, mtp(s_kv=kv)) is True and pt.matched_entry(row, mtp(s_kv=kv)).study == study
-        assert pt.lookup(row, mtp(s_kv=kv, b=128, h_q=8, h_kv=1)) is False  # 128 parallel tiles: past the full-cache floor
-        assert pt.lookup(row, mtp(s_kv=kv, b=128, h_q=8, h_kv=1, window_left=127)) is True
+    study = "sm90_d64_sink_mtp_longkv_20261128"
+    for kv in (long_kv, long_kv + 1, 131072):
+        for b, h_q, h_kv in ((1, 64, 8), (128, 64, 8), (128, 8, 1)):
+            f = mtp(s_kv=kv, b=b, h_q=h_q, h_kv=h_kv)
+            assert pt.class_key(row, f)[4] == "mtp_long_kv" and pt.class_key(row, f)[8] == "gqa_unpacked"
+            assert pt.lookup(row, f) is True and pt.matched_entry(row, f).study == study
+    below = mtp(s_kv=long_kv - 128, b=128, h_q=8, h_kv=1)
+    assert pt.class_key(row, below)[4] == "mtp" and pt.lookup(row, below) is False
+    for other in (mtp(window_left=127), mtp(h_kv=64), mtp(s_q=1), mtp(s_q=5), mtp(has_sink=False)):
+        key = pt.class_key(row, other)
+        assert key is None or key[4] != "mtp_long_kv"
+    rubin = pt.class_key("sdpa_fwd_prefill_sm107", mtp(device_cc=(10, 7)))
+    assert rubin is None or rubin[4] != "mtp_long_kv"
 
 
 @pytest.mark.L0
